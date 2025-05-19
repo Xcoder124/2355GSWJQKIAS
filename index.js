@@ -25,7 +25,7 @@ app.post('/get-mlbb-username', async (req, res) => {
         "Content-Type": "application/json",
         "User-Agent": "Mozilla/5.0",
         "Origin": "https://www.codashop.com",
-        "Referer": "https://www.codashop.com/sg/mobile-legends"
+        "Referer": "https://www.codashop.com/"
       }
     });
 
