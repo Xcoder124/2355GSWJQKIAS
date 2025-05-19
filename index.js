@@ -3,7 +3,10 @@ const axios = require('axios');
 const cors = require('cors');
 const app = express();
 
-app.use(cors()); // Allow frontend requests
+// In-memory cache (stores usernames to avoid duplicate API calls)
+const usernameCache = new Map(); // Format: `${userId}|${zoneId}` => username
+
+app.use(cors());
 app.use(express.json());
 
 app.post('/get-mlbb-username', async (req, res) => {
@@ -11,6 +14,15 @@ app.post('/get-mlbb-username', async (req, res) => {
   
   if (!userId || !zoneId) {
     return res.status(400).json({ error: "UserID and ZoneID are required" });
+  }
+
+  // Check cache first
+  const cacheKey = `${userId}|${zoneId}`;
+  if (usernameCache.has(cacheKey)) {
+    return res.json({ 
+      username: usernameCache.get(cacheKey),
+      cached: true // Optional: Flag to indicate cached response
+    });
   }
 
   try {
@@ -32,6 +44,9 @@ app.post('/get-mlbb-username', async (req, res) => {
     const username = decodeURIComponent(response.data.result?.username || "")
       .replace(/\+/g, ' ')
       .trim();
+
+    // Store in cache
+    usernameCache.set(cacheKey, username);
     
     res.json({ username });
   } catch (error) {
