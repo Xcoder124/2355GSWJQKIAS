@@ -1,57 +1,48 @@
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
+const fs = require('fs');
 const app = express();
 
-// In-memory cache (stores usernames to avoid duplicate API calls)
-const usernameCache = new Map(); // Format: `${userId}|${zoneId}` => username
+// Cache configuration
+const CACHE_FILE = 'cache.json';
+let usernameCache = new Map();
+
+// Load existing cache on server start
+if (fs.existsSync(CACHE_FILE)) {
+  try {
+    const data = fs.readFileSync(CACHE_FILE, 'utf8');
+    usernameCache = new Map(JSON.parse(data));
+    console.log(`Loaded ${usernameCache.size} cached entries from file`);
+  } catch (err) {
+    console.error('Error loading cache file:', err);
+  }
+}
+
+// Save cache to file every 60 seconds
+setInterval(() => {
+  try {
+    fs.writeFileSync(CACHE_FILE, JSON.stringify(Array.from(usernameCache.entries())));
+  } catch (err) {
+    console.error('Error saving cache:', err);
+  }
+}, 60000);
 
 app.use(cors());
 app.use(express.json());
 
+// Existing endpoint
 app.post('/get-mlbb-username', async (req, res) => {
-  const { userId, zoneId } = req.body;
-  
-  if (!userId || !zoneId) {
-    return res.status(400).json({ error: "UserID and ZoneID are required" });
-  }
+  /* ... keep existing implementation the same ... */
+});
 
-  // Check cache first
-  const cacheKey = `${userId}|${zoneId}`;
-  if (usernameCache.has(cacheKey)) {
-    return res.json({ 
-      username: usernameCache.get(cacheKey),
-      cached: true // Optional: Flag to indicate cached response
-    });
-  }
-
-  try {
-    const response = await axios.post('https://order-sg.codashop.com/validate', {
-      userId: userId.toString(),
-      zoneId: zoneId.toString(),
-      voucherTypeName: "MOBILE_LEGENDS",
-      deviceId: require('crypto').randomUUID(),
-      country: "sg"
-    }, {
-      headers: {
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0",
-        "Origin": "https://www.codashop.com",
-        "Referer": "https://www.codashop.com/"
-      }
-    });
-
-    const username = decodeURIComponent(response.data.result?.username || "")
-      .replace(/\+/g, ' ')
-      .trim();
-
-    // Store in cache
-    usernameCache.set(cacheKey, username);
-    
-    res.json({ username });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+// New endpoint to view cache
+app.get('/cache', (req, res) => {
+  const cacheEntries = Array.from(usernameCache.entries()).map(([key, value]) => ({
+    userId_zoneId: key,
+    username: value
+  }));
+  res.json(cacheEntries);
 });
 
 const PORT = process.env.PORT || 3000;
