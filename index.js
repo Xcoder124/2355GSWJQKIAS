@@ -132,7 +132,7 @@ const TransactionTypeServer = { // Define on server to avoid client-side mismatc
 
 
 // Endpoint 1: After a gift order is successfully created by the sender on the client
-app.post('/api/gift-order-processed', /* authenticateToken, */ async (req, res) => {
+app.post('/api/gift-order-processed', authenticateToken, async (req, res) => {
     const {
         orderId,
         recipientUid,
@@ -201,7 +201,7 @@ app.post('/api/gift-order-processed', /* authenticateToken, */ async (req, res) 
 
 
 // Endpoint 2: After a gift is successfully claimed by the recipient on the client
-app.post('/api/gift-claimed-processed', /* authenticateToken, */ async (req, res) => {
+app.post('/api/gift-claimed-processed', authenticateToken, async (req, res) => {
     const { orderId, senderUid } = req.body;
 
     if (!orderId || !senderUid) {
@@ -239,7 +239,7 @@ app.post('/api/gift-claimed-processed', /* authenticateToken, */ async (req, res
 });
 
 // Endpoint 3: After a gift is successfully refunded by the sender on the client
-app.post('/api/gift-refund-processed', /* authenticateToken, */ async (req, res) => {
+app.post('/api/gift-refund-processed', authenticateToken, async (req, res) => {
     const { orderId, recipientUid } = req.body;
 
     if (!orderId || !recipientUid) {
@@ -278,7 +278,7 @@ app.post('/api/gift-refund-processed', /* authenticateToken, */ async (req, res)
 
 
 // (Optional but Recommended) Endpoint 4: For voucher redemption count update
-app.post('/api/voucher-redeemed', /* authenticateToken, */ async (req, res) => {
+app.post('/api/voucher-redeemed', authenticateToken, async (req, res) => {
     const { voucherId, userId } = req.body; // userId is the user who redeemed it
 
     if (!voucherId || !userId) {
