@@ -8,15 +8,8 @@ const app = express();
 // Import Firebase Admin SDK
 const admin = require('firebase-admin');
 
-// ----- FIREBASE ADMIN INITIALIZATION -----
-// IMPORTANT:
-// 1. Download your service account key JSON file from Firebase Project Settings > Service accounts.
-// 2. Store this file securely in your Render.com project.
-// 3. DO NOT commit it to a public repository.
-// 4. On Render.com, you can upload this file or set its content as an environment variable.
-//    For this example, we'll assume a file path.
 try {
-    const serviceAccount = require('./path-to-your-serviceAccountKey.json'); // <-- REPLACE WITH ACTUAL PATH
+    const serviceAccount = require('/etc/secrets/serviceAccountKey.json'); 
     admin.initializeApp({
         credential: admin.credential.cert(serviceAccount)
     });
