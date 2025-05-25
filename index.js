@@ -16,8 +16,7 @@ try {
     console.log("Firebase Admin SDK initialized successfully.");
 } catch (error) {
     console.error("Error initializing Firebase Admin SDK:", error);
-    // Consider exiting if Firebase Admin can't initialize, as core functionality will fail
-    // process.exit(1);
+    process.exit(1);
 }
 
 const dbAdmin = admin.firestore(); // Firestore instance from Admin SDK
@@ -49,10 +48,9 @@ setInterval(() => {
     }
 }, 60000);
 
-app.use(cors()); // Consider restricting CORS in production
+app.use(cors()); 
 app.use(express.json());
 
-// Your existing /get-mlbb-username endpoint
 app.post('/get-mlbb-username', async (req, res) => {
     const { userId, zoneId } = req.body;
     if (!userId || !zoneId) {
@@ -120,8 +118,7 @@ async function authenticateToken(req, res, next) {
         res.status(403).send('Unauthorized: Invalid token.');
     }
 }
-// For simplicity in this example, I will not apply `authenticateToken` to every route below,
-// but you SHOULD add it for production to secure these endpoints.
+
 
 const TransactionTypeServer = { // Define on server to avoid client-side mismatch issues
     Order: 'Order',
