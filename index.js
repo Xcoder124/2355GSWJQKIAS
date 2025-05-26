@@ -519,6 +519,247 @@ app.post('/api/update-claimed-gift-delivery-details', authenticateToken, async (
     }
 });
 
+app.post('/api/check-redemption-code', authenticateToken, async (req, res) => {
+    const { code } = req.body;
+    const userId = req.user.uid;
+
+    if (!code) {
+        return res.status(400).json({ success: false, error: "Redemption code is required." });
+    }
+
+    try {
+        const rewardsQuery = dbAdmin.collection("rewards").where("code", "==", code.toUpperCase());
+        const rewardsSnapshot = await rewardsQuery.get();
+
+        if (rewardsSnapshot.empty) {
+            return res.status(404).json({ success: false, error: "Invalid or expired redemption code." });
+        }
+
+        const rewardDoc = rewardsSnapshot.docs[0];
+        const rewardData = rewardDoc.data();
+        const rewardId = rewardDoc.id;
+
+        // Check expiration
+        if (rewardData.expirationDate) {
+            const expirationDate = (rewardData.expirationDate.toDate) ? rewardData.expirationDate.toDate() : new Date(rewardData.expirationDate);
+            if (new Date() > expirationDate) {
+                return res.status(400).json({ success: false, error: "This code has expired." });
+            }
+        }
+
+        // Check global redemption limit
+        const redemptionCount = Number(rewardData.redemptionCount) || 0;
+        const maxRedemptions = Number(rewardData.maxRedemptions);
+        if (maxRedemptions > 0 && redemptionCount >= maxRedemptions) {
+            return res.status(400).json({ success: false, error: "This code has reached its global redemption limit." });
+        }
+
+        // Check if user has already redeemed this specific reward (if applicable based on type)
+        // For 'choices' and 'airdrop' type, a user typically redeems it once.
+        // For 'form' or 'redemptionKey', it might depend on your specific logic.
+        if (rewardData.type === 'choices' || rewardData.type === 'airdrop' || rewardData.type === 'form') {
+            const userTransactionsRef = dbAdmin.collection("users").doc(userId).collection("transactions");
+            const priorRedemptionQuery = userTransactionsRef
+                .where("relatedDocId", "==", rewardId)
+                .where("type", "in", [TransactionTypeServer.Receive, TransactionTypeServer.Redeemed]); // "Receive" for choices, "Redeemed" for airdrop/form
+            const priorRedemptionSnapshot = await priorRedemptionQuery.get();
+
+            if (!priorRedemptionSnapshot.empty) {
+                return res.status(400).json({ success: false, error: "You have already redeemed/claimed this code." });
+            }
+        }
+
+        // Return necessary reward data (excluding sensitive info if any)
+        res.status(200).json({
+            success: true,
+            message: "Code is valid.",
+            reward: {
+                id: rewardId,
+                title: rewardData.title,
+                type: rewardData.type,
+                value: rewardData.value, // Be cautious about exposing this if it's not meant for client display before claim
+                imageUrl: rewardData.imageUrl,
+                instructions: rewardData.instructions,
+                formFields: rewardData.formFields, // For 'form' type
+                RedemptionKeyHint: rewardData.RedemptionKeyHint, // For 'redemptionKey' type
+                // Do NOT return the actual RedemptionKey here
+                maxRedemptions: rewardData.maxRedemptions,
+                redemptionCount: rewardData.redemptionCount
+            }
+        });
+
+    } catch (error) {
+        console.error("Error in /api/check-redemption-code:", error);
+        res.status(500).json({ success: false, error: "Server error checking code. Please try again." });
+    }
+});
+
+
+// Endpoint 2: Process Redemption (handles 'choices' type directly, initiates others)
+app.post('/api/redeem-code', authenticateToken, async (req, res) => {
+    const { code } = req.body; // Client sends the code they want to redeem
+    const userId = req.user.uid;
+
+    if (!code) {
+        return res.status(400).json({ success: false, error: "Redemption code is required." });
+    }
+
+    try {
+        const result = await dbAdmin.runTransaction(async (transaction) => {
+            const rewardsQuery = dbAdmin.collection("rewards").where("code", "==", code.toUpperCase());
+            const rewardsSnapshot = await transaction.get(rewardsQuery);
+
+            if (rewardsSnapshot.empty) {
+                throw new Error("Invalid or expired redemption code.");
+            }
+
+            const rewardDocRef = rewardsSnapshot.docs[0].ref;
+            const rewardData = rewardsSnapshot.docs[0].data();
+            const rewardId = rewardDocRef.id;
+
+            // --- Re-validate reward (expiration, limits) within transaction ---
+            if (rewardData.expirationDate) {
+                const expirationDate = (rewardData.expirationDate.toDate) ? rewardData.expirationDate.toDate() : new Date(rewardData.expirationDate);
+                if (new Date() > expirationDate) throw new Error("This code has expired.");
+            }
+            const redemptionCount = Number(rewardData.redemptionCount) || 0;
+            const maxRedemptions = Number(rewardData.maxRedemptions);
+            if (maxRedemptions > 0 && redemptionCount >= maxRedemptions) {
+                throw new Error("This code has reached its global redemption limit.");
+            }
+
+            // --- Check user's prior redemption within transaction ---
+            const userTransactionsRef = dbAdmin.collection("users").doc(userId).collection("transactions");
+            // Adjust types based on what you check for "already redeemed" for each reward type
+            let relevantTxTypes = [TransactionTypeServer.Receive, TransactionTypeServer.Redeemed];
+            if (rewardData.type === 'redemptionKey') { // Example: Maybe redemptionKey can be used multiple times?
+                // relevantTxTypes = []; // Or a specific type if one is logged
+            }
+
+            if (relevantTxTypes.length > 0) {
+                const priorRedemptionQuery = userTransactionsRef
+                    .where("relatedDocId", "==", rewardId)
+                    .where("type", "in", relevantTxTypes);
+                const priorRedemptionSnapshot = await transaction.get(priorRedemptionQuery);
+                if (!priorRedemptionSnapshot.empty) {
+                    throw new Error("You have already redeemed/claimed this code.");
+                }
+            }
+
+            const userRef = dbAdmin.collection("users").doc(userId);
+            const userDoc = await transaction.get(userRef);
+            if (!userDoc.exists) {
+                throw new Error("User data not found. Cannot process redemption.");
+            }
+            const userData = userDoc.data();
+
+            // --- Perform actions based on reward type ---
+            let transactionType, transactionAmount, transactionDescription, responseMessage;
+            let userBalanceUpdate = {};
+            let rewardUpdate = {
+                redemptionCount: FieldValueAdmin.increment(1),
+                lastRedeemedAt: FieldValueAdmin.serverTimestamp()
+            };
+            let additionalResponseData = {};
+
+            if (rewardData.type === 'choices') {
+                transactionType = TransactionTypeServer.Receive; // Using 'Receive' for balance addition
+                transactionAmount = Number(rewardData.value) || 0;
+                if (transactionAmount <= 0) throw new Error("Invalid reward value for 'choices' type.");
+
+                transactionDescription = `Redeemed: ${rewardData.title || rewardData.code}`;
+                responseMessage = `🎉 Code redeemed! +${transactionAmount.toLocaleString()} added to your balance.`;
+                userBalanceUpdate = {
+                    balance: FieldValueAdmin.increment(transactionAmount)
+                };
+                // For 'choices' type, the 'value' of the reward itself might be a pool that decreases.
+                // If `rewardData.value` is the total available points in the reward itself that deplete:
+                // rewardUpdate.value = FieldValueAdmin.increment(-transactionAmount); // If reward.value is a pool
+                // Ensure rewardUpdate.value doesn't go below 0 if it's a pool.
+                // For simplicity here, assuming rewardData.value is the fixed amount given per redemption.
+            } else if (rewardData.type === 'airdrop') {
+                transactionType = TransactionTypeServer.Redeemed; // A claim record, not direct value
+                transactionAmount = 0; // Airdrop itself doesn't add balance directly
+                transactionDescription = `Airdrop claimed: ${rewardData.title || rewardData.code}`;
+                responseMessage = `Airdrop "${rewardData.title || rewardData.code}" claimed! Proceed to select your reward(s).`;
+                additionalResponseData = { proceedTo: 'choicesModal', rewardValueForChoices: rewardData.value };
+            } else if (rewardData.type === 'form') {
+                transactionType = TransactionTypeServer.Redeemed; // Record of claim
+                transactionAmount = 0; // Form itself doesn't add balance directly
+                transactionDescription = `Form access code redeemed: ${rewardData.title || rewardData.code}`;
+                responseMessage = `Code "${rewardData.title || rewardData.code}" accepted. Please fill the form.`;
+                additionalResponseData = { proceedTo: 'formModal' };
+            } else if (rewardData.type === 'redemptionKey') {
+                transactionType = TransactionTypeServer.Redeemed; // Record of claim
+                transactionAmount = 0;
+                transactionDescription = `Key code input: ${rewardData.title || rewardData.code}`;
+                responseMessage = `Code "${rewardData.title || rewardData.code}" is a special key. Enter it in the next step.`;
+                additionalResponseData = { proceedTo: 'redemptionKeyModal' };
+            } else {
+                throw new Error(`Unsupported reward type: ${rewardData.type}`);
+            }
+
+            // Update reward document
+            transaction.update(rewardDocRef, rewardUpdate);
+
+            // Update user document
+            const finalUserUpdates = {
+                ...userBalanceUpdate,
+                transactionCount: FieldValueAdmin.increment(1),
+                lastTransaction: FieldValueAdmin.serverTimestamp(),
+                [`transactionStats.${transactionType}`]: FieldValueAdmin.increment(1)
+            };
+            if (userData.firstTransaction === null && (userData.transactionCount === 0 || typeof userData.transactionCount === 'undefined')) {
+                finalUserUpdates.firstTransaction = FieldValueAdmin.serverTimestamp();
+            }
+            transaction.update(userRef, finalUserUpdates);
+
+            // Create transaction record for the user
+            const newTransactionRef = userTransactionsRef.doc();
+            transaction.set(newTransactionRef, {
+                timestamp: FieldValueAdmin.serverTimestamp(),
+                type: transactionType,
+                amount: transactionAmount,
+                reference: newTransactionRef.id,
+                description: transactionDescription,
+                externalReference: rewardData.code,
+                relatedDocId: rewardId,
+                metadata: {
+                    rewardTitle: rewardData.title || "N/A",
+                    rewardType: rewardData.type,
+                    code: rewardData.code,
+                    ...(rewardData.type === 'airdrop' && { airdropNominalValue: rewardData.value })
+                }
+            });
+
+            const newBalance = (userData.balance || 0) + (userBalanceUpdate.balance ? transactionAmount : 0);
+
+            return {
+                message: responseMessage,
+                newBalance: newBalance,
+                transactionId: newTransactionRef.id,
+                rewardType: rewardData.type,
+                rewardDetails: { // Send back some reward details for client UI
+                    id: rewardId,
+                    title: rewardData.title,
+                    value: rewardData.value, // Original value for airdrop choices, etc.
+                    imageUrl: rewardData.imageUrl,
+                    instructions: rewardData.instructions,
+                    formFields: rewardData.formFields,
+                    RedemptionKeyHint: rewardData.RedemptionKeyHint
+                },
+                ...additionalResponseData
+            };
+        }); // End of Firestore Transaction
+
+        res.status(200).json({ success: true, ...result });
+
+    } catch (error) {
+        console.error("Error in /api/redeem-code:", error);
+        res.status(500).json({ success: false, error: error.message || "Server error redeeming code." });
+    }
+});
+
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
