@@ -460,5 +460,65 @@ app.post('/api/claim-gift', authenticateToken, async (req, res) => {
     }
 });
 
+app.post('/api/update-claimed-gift-delivery-details', authenticateToken, async (req, res) => {
+    const { orderId, deliveryDetailsFromRecipient } = req.body;
+    const claimingUserId = req.user.uid;
+
+    if (!orderId || !deliveryDetailsFromRecipient) {
+        return res.status(400).json({ success: false, error: "Missing orderId or delivery details." });
+    }
+    if (typeof deliveryDetailsFromRecipient !== 'object' || deliveryDetailsFromRecipient === null) {
+        return res.status(400).json({ success: false, error: "Invalid delivery details format." });
+    }
+
+    try {
+        const claimUpdateResult = await dbAdmin.runTransaction(async (transaction) => {
+            const orderRef = dbAdmin.collection("orders").doc(orderId);
+            const orderDoc = await transaction.get(orderRef);
+
+            if (!orderDoc.exists) {
+                throw new Error("Order not found. Cannot update delivery details.");
+            }
+            const orderData = orderDoc.data();
+
+            if (orderData.status !== "claimed" || orderData.claimedBy !== claimingUserId) {
+                throw new Error("This gift cannot be updated at this time or does not belong to you.");
+            }
+
+            const recipientOrderTxQuery = dbAdmin.collection("users").doc(claimingUserId)
+                .collection("transactions")
+                .where("relatedDocId", "==", orderId)
+                .where("type", "==", TransactionTypeServer.Order)
+                .limit(1);
+            const recipientOrderTxSnap = await transaction.get(recipientOrderTxQuery);
+
+            if (recipientOrderTxSnap.empty) {
+                console.error(`Recipient's claimed order transaction (type: Order, relatedDocId: ${orderId}) not found for user ${claimingUserId}.`);
+                throw new Error("Recipient's claimed order transaction record not found.");
+            }
+            const recipientOrderTxRef = recipientOrderTxSnap.docs[0].ref;
+
+            transaction.update(recipientOrderTxRef, {
+                'metadata.deliveryDetails': deliveryDetailsFromRecipient,
+                lastUpdatedAt: FieldValueAdmin.serverTimestamp()
+            });
+            transaction.update(orderRef, { // Also update main order for admin/record keeping
+                deliveryDetails: deliveryDetailsFromRecipient,
+                lastUpdatedAt: FieldValueAdmin.serverTimestamp()
+            });
+            return { updatedOrderId: orderId, newDeliveryDetails: deliveryDetailsFromRecipient };
+        });
+        res.status(200).json({
+            success: true,
+            message: "Delivery details updated successfully for your claimed gift.",
+            data: claimUpdateResult
+        });
+    } catch (error) {
+        console.error(`SERVER ERROR in /api/update-claimed-gift-delivery-details for order ${orderId}:`, error);
+        res.status(500).json({ success: false, error: error.message || "Failed to update delivery details." });
+    }
+});
+
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
