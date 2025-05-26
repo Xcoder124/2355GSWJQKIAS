@@ -303,6 +303,158 @@ app.post('/api/voucher-redeemed', authenticateToken, async (req, res) => {
     }
 });
 
+app.post('/api/claim-gift', authenticateToken, async (req, res) => {
+    const { orderId } = req.body;
+    const claimingUserId = req.user.uid; // uid from the authenticated user
+
+    if (!orderId) {
+        return res.status(400).json({ success: false, error: "Missing orderId." });
+    }
+
+    const orderRef = dbAdmin.collection("orders").doc(orderId);
+
+    try {
+        // It's good practice to run this as a Firestore transaction
+        // to ensure atomicity of reads and subsequent writes.
+        const claimResult = await dbAdmin.runTransaction(async (transaction) => {
+            const orderDoc = await transaction.get(orderRef);
+
+            if (!orderDoc.exists) {
+                // Throw an error to automatically roll back the transaction
+                throw new Error("Gift order not found.");
+            }
+            const orderData = orderDoc.data();
+
+            // --- Validations (Critical to perform these on the server) ---
+            if (!orderData.isGift) {
+                throw new Error("This is not a gift order.");
+            }
+            if (orderData.status !== 'sent_gift') {
+                if (orderData.status === 'claimed') throw new Error("This gift has already been claimed.");
+                throw new Error("This gift is not in a claimable state.");
+            }
+            if (orderData.giftRecipientUid !== claimingUserId) {
+                throw new Error("This gift is not intended for you.");
+            }
+            const giftExpirationDate = orderData.giftExpiration ? orderData.giftExpiration.toDate() : null;
+            if (giftExpirationDate && giftExpirationDate.getTime() <= Date.now()) {
+                // Future enhancement: Could trigger refund logic here or mark as truly expired
+                throw new Error("This gift has expired.");
+            }
+            if (!orderData.giftSenderId) {
+                console.error(`Critical: giftSenderId missing for orderId: ${orderId}`);
+                throw new Error("Gift sender information is missing. Cannot process claim at this time.");
+            }
+            // --- End of Validations ---
+
+            // Fetch recipient's (claiming user's) "Received_Gift" transaction
+            const receiverTransactionsQuery = dbAdmin.collection("users").doc(claimingUserId).collection("transactions")
+                .where("relatedDocId", "==", orderId)
+                .where("type", "==", TransactionTypeServer.Received_Gift); // Use server-side type
+
+            const receiverTransactionsSnap = await transaction.get(receiverTransactionsQuery); // Get within transaction
+            if (receiverTransactionsSnap.empty) {
+                throw new Error("Your gift reception record is missing. Please contact support.");
+            }
+            const receiverGiftTransactionRef = receiverTransactionsSnap.docs[0].ref;
+
+            // Product details (assuming they are sufficiently available in orderData or you fetch them)
+            const productNameForTx = orderData.productName || "Product";
+            const productGroupNameForTx = orderData.productGroupName || "Category";
+            const quantityForTx = orderData.quantity || 1;
+            const originalGiftPriceForTx = (orderData.singleItemPrice || 0) * quantityForTx;
+
+
+            // --- Prepare Batch Writes (within the Firestore transaction) ---
+            // Note: Inside a Firestore transaction, you use transaction.update(), transaction.set(), etc.
+            // instead of dbAdmin.batch().
+
+            // 1. Update the original order document
+            transaction.update(orderRef, {
+                status: "claimed",
+                claimedBy: claimingUserId,
+                claimedAt: FieldValueAdmin.serverTimestamp(),
+                lastUpdatedAt: FieldValueAdmin.serverTimestamp()
+            });
+
+            // 2. Create a new "Order" transaction for the recipient
+            const recipientNewOrderTxRef = dbAdmin.collection("users").doc(claimingUserId).collection("transactions").doc();
+            const recipientNewOrderTxData = {
+                timestamp: FieldValueAdmin.serverTimestamp(),
+                type: TransactionTypeServer.Order,
+                amount: 0,
+                reference: recipientNewOrderTxRef.id,
+                description: `Claimed gift: ${productNameForTx} from ${orderData.giftSenderDisplayName || 'a friend'}`,
+                externalReference: orderData.referenceNumber,
+                relatedDocId: orderId,
+                metadata: { /* ... same metadata as in your client-side handleClaimGift ... */
+                    orderId: orderId,
+                    orderReference: orderData.referenceNumber,
+                    productName: productNameForTx,
+                    quantity: quantityForTx,
+                    category: productGroupNameForTx,
+                    isGift: true,
+                    giftSenderId: orderData.giftSenderId,
+                    giftSenderDisplayName: orderData.giftSenderDisplayName,
+                    giftSenderPhotoURL: orderData.giftSenderPhotoURL || `https://api.dicebear.com/7.x/identicon/svg?seed=${orderData.giftSenderId}`,
+                    status: "completed", // For the new Order transaction
+                    orderDate: new Date().toISOString(),
+                    originalGiftPrice: originalGiftPriceForTx,
+                    deliveryDetails: { userEmail: req.user.email, ...(orderData.deliveryDetails || {}) }
+                }
+            };
+            transaction.set(recipientNewOrderTxRef, recipientNewOrderTxData);
+
+            // 3. Update the receiver's original "Received_Gift" transaction
+            transaction.update(receiverGiftTransactionRef, {
+                'metadata.status': "claimed",
+                status: "claimed",
+                lastUpdatedAt: FieldValueAdmin.serverTimestamp()
+            });
+
+            // 4. Update recipient's user document
+            const recipientUserRef = dbAdmin.collection("users").doc(claimingUserId);
+            transaction.update(recipientUserRef, {
+                orderCount: FieldValueAdmin.increment(1),
+                lastOrderAt: FieldValueAdmin.serverTimestamp(),
+                giftClaimedCount: FieldValueAdmin.increment(1),
+                lastGiftClaimedAt: FieldValueAdmin.serverTimestamp(),
+                [`transactionStats.${TransactionTypeServer.Order}`]: FieldValueAdmin.increment(1)
+            });
+
+            // (Optional but good practice) Update sender's "Gifted" transaction status
+            const senderGiftedTxQuery = dbAdmin.collection("users").doc(orderData.giftSenderId).collection("transactions")
+                .where("relatedDocId", "==", orderId)
+                .where("type", "==", TransactionTypeServer.Gifted);
+            const senderGiftedTxSnap = await transaction.get(senderGiftedTxQuery); // Get within transaction
+            if (!senderGiftedTxSnap.empty) {
+                senderGiftedTxSnap.docs.forEach(doc => {
+                    transaction.update(doc.ref, {
+                        'metadata.status': "claimed",
+                        lastUpdatedAt: FieldValueAdmin.serverTimestamp()
+                    });
+                });
+            } else {
+                console.warn(`Sender's 'Gifted' transaction not found for order ${orderId} during server-side claim.`);
+            }
+
+            // The transaction will return the updated order data.
+            return { ...orderData, status: "claimed", claimedBy: claimingUserId, orderId: orderRef.id }; // Return some useful data
+        });
+
+        // If the transaction is successful, claimResult will contain what you returned.
+        res.status(200).json({
+            success: true,
+            message: "Gift claimed successfully.",
+            claimedOrderData: claimResult // Send back data for UI update
+        });
+
+    } catch (error) {
+        console.error(`SERVER ERROR in /api/claim-gift for order ${orderId}, user ${claimingUserId}:`, error);
+        res.status(500).json({ success: false, error: error.message || "Failed to claim gift due to a server error." });
+    }
+});
+
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
