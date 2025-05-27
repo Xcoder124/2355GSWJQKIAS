@@ -720,7 +720,7 @@ app.post('/api/redeem-code', authenticateToken, async (req, res) => {
 
             // Handle specific reward types
             if (rewardData.type === 'choices') {
-                transactionType = TransactionTypeServer.Receive;
+                transactionType = TransactionTypeServer.Redeemed;
                 transactionAmount = Number(rewardData.value) || 0;
                 if (transactionAmount <= 0) throw new Error("Invalid reward value for 'choices' type.");
                 transactionDescription = `Redeemed: ${rewardData.title || rewardData.code}`;
@@ -1087,6 +1087,244 @@ app.post('/api/finalize-gift-claim', authenticateToken, async (req, res) => {
     } catch (error) {
         console.error(`SERVER ERROR /api/finalize-gift-claim for order ${originalOrderId}, user ${claimingUserId}:`, error);
         res.status(500).json({ success: false, error: error.message || "Failed to finalize gift claim." });
+    }
+});
+
+// Add these helper functions (if they don't exist or to ensure they align)
+function determineCollectionFromType(typeString) {
+    if (typeString === 'Discount Voucher' || typeString === 'Fee Voucher' || typeString === 'Voucher Type') { // 'Voucher Type' seems to be a possible stored type for Fee Voucher
+        return 'vouchers';
+    }
+    return 'rewards';
+}
+
+// --- ADMIN PANEL API ENDPOINTS ---
+
+// Create Entry (Reward/Voucher)
+app.post('/api/admin/entries', authenticateToken, async (req, res) => {
+    try {
+        let data = req.body;
+        const targetCollectionName = determineCollectionFromType(data.type);
+
+        if (data.expirationDate) {
+            const dateObj = new Date(data.expirationDate);
+            if (!isNaN(dateObj.getTime())) {
+                data.expirationDate = TimestampAdmin.fromDate(dateObj);
+            } else {
+                // Keep as string or handle as error if date must be valid
+                console.warn("Invalid expirationDate string during creation:", data.expirationDate);
+                // Or delete data.expirationDate; or return res.status(400).json({ error: "Invalid expiration date format." });
+            }
+        }
+        
+        data.createdAt = FieldValueAdmin.serverTimestamp(); // Backend timestamp
+
+        const collRef = dbAdmin.collection(targetCollectionName);
+        // Let Firestore generate the ID
+        const newDocRef = collRef.doc();
+        await newDocRef.set(data);
+        const newDocId = newDocRef.id;
+
+        // Log to rewardHistory
+        await dbAdmin.collection('rewardHistory').add({
+            action: `Created ${targetCollectionName === 'vouchers' ? 'voucher' : 'reward'} in document ${newDocId}`,
+            documentId: newDocId,
+            targetCollection: targetCollectionName,
+            timestamp: FieldValueAdmin.serverTimestamp(),
+            user: "AdminPanel" // Or req.user.uid if you want to log the specific admin
+        });
+
+        res.status(201).json({ success: true, id: newDocId, message: `${targetCollectionName === 'vouchers' ? 'Voucher' : 'Reward'} created successfully` });
+    } catch (error) {
+        console.error("Error in POST /api/admin/entries:", error);
+        res.status(500).json({ success: false, error: error.message || "Failed to create entry." });
+    }
+});
+
+// Get Entry (for editing)
+app.get('/api/admin/entries/:collectionName/:id', authenticateToken, async (req, res) => {
+    try {
+        const { collectionName, id } = req.params;
+        if (collectionName !== 'rewards' && collectionName !== 'vouchers') {
+            return res.status(400).json({ success: false, error: "Invalid collection name." });
+        }
+        const docRef = dbAdmin.collection(collectionName).doc(id);
+        const docSnap = await docRef.get();
+
+        if (!docSnap.exists) {
+            return res.status(404).json({ success: false, error: "Entry not found." });
+        }
+        let data = docSnap.data();
+        // Convert Firestore Timestamp to ISO string for datetime-local input
+        if (data.expirationDate && data.expirationDate instanceof TimestampAdmin) {
+            data.expirationDate = data.expirationDate.toDate().toISOString().slice(0, 16);
+        }
+        if (data.createdAt && data.createdAt instanceof TimestampAdmin) {
+            data.createdAt = data.createdAt.toDate().toISOString();
+        }
+         if (data.lastRedeemedAt && data.lastRedeemedAt instanceof TimestampAdmin) {
+            data.lastRedeemedAt = data.lastRedeemedAt.toDate().toISOString();
+        }
+
+
+        res.status(200).json({ success: true, id: docSnap.id, data: data });
+    } catch (error) {
+        console.error(`Error in GET /api/admin/entries/${req.params.collectionName}/${req.params.id}:`, error);
+        res.status(500).json({ success: false, error: error.message || "Failed to fetch entry." });
+    }
+});
+
+// Update Entry
+app.put('/api/admin/entries/:collectionName/:id', authenticateToken, async (req, res) => {
+    try {
+        const { collectionName, id } = req.params;
+        let data = req.body;
+
+        if (collectionName !== 'rewards' && collectionName !== 'vouchers') {
+            return res.status(400).json({ success: false, error: "Invalid collection name." });
+        }
+
+        // Prevent changing ID or original createdAt
+        delete data.id;
+        delete data.createdAt; 
+
+        if (data.expirationDate) {
+            const dateObj = new Date(data.expirationDate);
+            if (!isNaN(dateObj.getTime())) {
+                data.expirationDate = TimestampAdmin.fromDate(dateObj);
+            } else if (data.expirationDate === null || data.expirationDate === '') {
+                 data.expirationDate = null; // Allow clearing the date
+            } else {
+                console.warn("Invalid expirationDate string during update:", data.expirationDate);
+                // return res.status(400).json({ error: "Invalid expiration date format." });
+            }
+        } else {
+             // If expirationDate is not provided in payload, ensure it's not accidentally set to something wrong
+             // or explicitly set to null if intended to be cleared and not present
+            if (data.hasOwnProperty('expirationDate') && data.expirationDate === undefined) {
+                 data.expirationDate = null;
+            }
+        }
+        
+        data.lastUpdatedAt = FieldValueAdmin.serverTimestamp(); // Add/update lastUpdatedAt timestamp
+
+        const docRef = dbAdmin.collection(collectionName).doc(id);
+        await docRef.update(data);
+
+        // Log to rewardHistory
+        await dbAdmin.collection('rewardHistory').add({
+            action: `Updated ${collectionName === 'vouchers' ? 'voucher' : 'reward'} in document ${id}`,
+            documentId: id,
+            targetCollection: collectionName,
+            timestamp: FieldValueAdmin.serverTimestamp(),
+            user: "AdminPanel"
+        });
+
+        res.status(200).json({ success: true, message: "Entry updated successfully." });
+    } catch (error) {
+        console.error(`Error in PUT /api/admin/entries/${req.params.collectionName}/${req.params.id}:`, error);
+        res.status(500).json({ success: false, error: error.message || "Failed to update entry." });
+    }
+});
+
+// Delete Entry
+app.delete('/api/admin/entries/:collectionName/:id', authenticateToken, async (req, res) => {
+    try {
+        const { collectionName, id } = req.params;
+        if (collectionName !== 'rewards' && collectionName !== 'vouchers') {
+            return res.status(400).json({ success: false, error: "Invalid collection name." });
+        }
+
+        const docRef = dbAdmin.collection(collectionName).doc(id);
+        await docRef.delete();
+
+        // Log to rewardHistory
+        await dbAdmin.collection('rewardHistory').add({
+            action: `Deleted ${collectionName === 'vouchers' ? 'voucher' : 'reward'} from document ${id}`,
+            documentId: id,
+            targetCollection: collectionName,
+            timestamp: FieldValueAdmin.serverTimestamp(),
+            user: "AdminPanel"
+        });
+
+        res.status(200).json({ success: true, message: "Entry deleted successfully." });
+    } catch (error) {
+        console.error(`Error in DELETE /api/admin/entries/${req.params.collectionName}/${req.params.id}:`, error);
+        res.status(500).json({ success: false, error: error.message || "Failed to delete entry." });
+    }
+});
+
+// List History
+app.get('/api/admin/history', authenticateToken, async (req, res) => {
+    try {
+        const historySnapshot = await dbAdmin.collection('rewardHistory')
+                                          .orderBy('timestamp', 'desc') // Already sorted in client, but good practice
+                                          .get();
+        const entries = historySnapshot.docs.map(docSnap => {
+            const data = docSnap.data();
+            // Convert Firestore Timestamps to ISO strings
+            const ts = data.timestamp instanceof TimestampAdmin ? data.timestamp.toDate() : null;
+            return {
+                id: docSnap.id,
+                ...data,
+                timestamp: ts ? ts.toISOString() : null, // Send as ISO string
+                // Client expects 'date' and 'time' strings, it can derive them or backend can provide
+                date: ts ? ts.toLocaleDateString() : 'Unknown date',
+                time: ts ? ts.toLocaleTimeString() : 'Unknown time'
+            };
+        });
+        res.status(200).json({ success: true, entries: entries });
+    } catch (error) {
+        console.error("Error in GET /api/admin/history:", error);
+        res.status(500).json({ success: false, error: error.message || "Failed to load history." });
+    }
+});
+
+// Search Entry by Code
+app.post('/api/admin/search-entry', authenticateToken, async (req, res) => {
+    const { code } = req.body;
+    if (!code) {
+        return res.status(400).json({ success: false, error: "Code is required for search." });
+    }
+    try {
+        let foundDoc = null;
+        let foundInCollection = '';
+
+        const rewardsQuery = dbAdmin.collection('rewards').where('code', '==', code.toUpperCase());
+        let snap = await rewardsQuery.get();
+        if (!snap.empty) {
+            foundDoc = snap.docs[0];
+            foundInCollection = 'rewards';
+        } else {
+            const vouchersQuery = dbAdmin.collection('vouchers').where('code', '==', code.toUpperCase());
+            snap = await vouchersQuery.get();
+            if (!snap.empty) {
+                foundDoc = snap.docs[0];
+                foundInCollection = 'vouchers';
+            }
+        }
+
+        if (foundDoc) {
+            res.status(200).json({ success: true, found: true, id: foundDoc.id, collectionName: foundInCollection, data: foundDoc.data() });
+        } else {
+            res.status(404).json({ success: false, found: false, message: `Code "${code}" not found.` });
+        }
+    } catch (error) {
+        console.error("Error in POST /api/admin/search-entry:", error);
+        res.status(500).json({ success: false, error: error.message || "Search failed." });
+    }
+});
+
+// Endpoint to fetch users for privacy modal (if not already available/secured)
+// This assumes your 'users' collection is readable by the admin service account.
+app.get('/api/admin/users', authenticateToken, async (req, res) => {
+    try {
+        const usersSnapshot = await dbAdmin.collection('users').get();
+        const users = usersSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        res.status(200).json({ success: true, users });
+    } catch (error) {
+        console.error("Error fetching users for admin panel:", error);
+        res.status(500).json({ success: false, error: "Failed to fetch users." });
     }
 });
 
