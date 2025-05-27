@@ -1,15 +1,14 @@
 const express = require('express');
 const axios = require('axios');
-const cors = require('cors');
+const cors =require('cors');
 const fs = require('fs');
 const crypto = require('crypto');
 const app = express();
 
-// Import Firebase Admin SDK
 const admin = require('firebase-admin');
 
 try {
-    const serviceAccount = require('/etc/secrets/serviceAccountKey.json'); 
+    const serviceAccount = require('/etc/secrets/serviceAccountKey.json');
     admin.initializeApp({
         credential: admin.credential.cert(serviceAccount)
     });
@@ -19,13 +18,10 @@ try {
     process.exit(1);
 }
 
-const dbAdmin = admin.firestore(); // Firestore instance from Admin SDK
+const dbAdmin = admin.firestore();
 const TimestampAdmin = admin.firestore.Timestamp;
 const FieldValueAdmin = admin.firestore.FieldValue;
-// ----- END FIREBASE ADMIN INITIALIZATION -----
 
-
-// Cache configuration (your existing code)
 const CACHE_FILE = 'cache.json';
 let usernameCache = new Map();
 
@@ -42,14 +38,357 @@ if (fs.existsSync(CACHE_FILE)) {
 setInterval(() => {
     try {
         fs.writeFileSync(CACHE_FILE, JSON.stringify(Array.from(usernameCache.entries())));
-        console.log(`Cache saved (${usernameCache.size} entries)`);
     } catch (err) {
         console.error('Error saving cache:', err);
     }
 }, 60000);
 
-app.use(cors()); 
+app.use(cors());
 app.use(express.json());
+
+async function authenticateToken(req, res, next) {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return res.status(403).send('Unauthorized: No token provided.');
+    }
+    const idToken = authHeader.split('Bearer ')[1];
+    try {
+        const decodedToken = await admin.auth().verifyIdToken(idToken);
+        req.user = decodedToken;
+        next();
+    } catch (error) {
+        console.error('Error verifying Firebase ID token:', error);
+        res.status(403).send('Unauthorized: Invalid token.');
+    }
+}
+
+const TransactionTypeServer = {
+    Order: 'Order',
+    Receive: 'Receive',
+    Sent: 'Sent',
+    Redeemed: 'Redeemed',
+    Gifted: 'Gifted',
+    Received_Gift: 'Received Gift',
+    Refund: 'Refund'
+};
+
+function calculateServerFees(price) {
+    if (price < 0) return 0;
+    if (price >= 100 && price <= 10000) return 500;
+    if (price >= 10100 && price <= 99900) return 1000;
+    if (price >= 100000 && price <= 500000) return 3000;
+    return 0;
+}
+
+async function fetchProductFromDB(productId) {
+    const categoriesSnapshot = await dbAdmin.collection('Choices').get();
+    for (const categoryDoc of categoriesSnapshot.docs) {
+        const categoryData = categoryDoc.data();
+        for (const groupName in categoryData) {
+            if (categoryData[groupName] && typeof categoryData[groupName] === 'object' && categoryData[groupName].products) {
+                if (categoryData[groupName].products[productId]) {
+                    const product = categoryData[groupName].products[productId];
+                    if (product.price === undefined || isNaN(parseFloat(product.price))) {
+                        console.error(`Product ${productId} in ${categoryDoc.id}/${groupName} has invalid price.`);
+                        return null;
+                    }
+                    return {
+                        id: productId,
+                        name: product.name,
+                        price: parseFloat(product.price),
+                        description: product.description,
+                        image: product.image,
+                        productGroupName: groupName,
+                        mainCategoryName: categoryDoc.id,
+                        isProductGroupUnavailable: (typeof categoryData[groupName].availability === 'string' && categoryData[groupName].availability.toLowerCase() === 'unavailable')
+                    };
+                }
+            }
+        }
+    }
+    console.warn(`Product with ID ${productId} not found across all categories.`);
+    return null;
+}
+
+async function validateVoucherOnServer(voucherCode, productPrice, quantity, userId) {
+    const result = { isValid: false, deduction: 0, message: '', appliedVoucherData: null };
+    if (!voucherCode) {
+        result.message = "No voucher code provided.";
+        return result;
+    }
+
+    const vouchersRef = dbAdmin.collection("vouchers");
+    const q = vouchersRef.where("code", "==", voucherCode.toUpperCase());
+    const querySnapshot = await q.get();
+
+    if (querySnapshot.empty) {
+        result.message = 'Invalid voucher code.';
+        return result;
+    }
+
+    const voucherDoc = querySnapshot.docs[0];
+    const voucherData = { id: voucherDoc.id, ...voucherDoc.data() };
+
+    const userSnap = await dbAdmin.collection("users").doc(userId).get();
+    if (!userSnap.exists) {
+        result.message = 'User not found for voucher validation.';
+        return result;
+    }
+    const userData = userSnap.data();
+
+    if (userData.redeemedVoucherIds && userData.redeemedVoucherIds.includes(voucherDoc.id)) {
+        result.message = 'You have already redeemed this voucher.';
+        return result;
+    }
+
+    const redemptionCount = Number(voucherData.redemptionCount) || 0;
+    const maxRedemptions = Number(voucherData.maxRedemptions);
+    if (typeof maxRedemptions === 'number' && !isNaN(maxRedemptions) && redemptionCount >= maxRedemptions) {
+        result.message = 'This voucher has reached its maximum redemption limit.';
+        return result;
+    }
+
+    if (voucherData.expirationDate && voucherData.expirationDate.toDate() < new Date()) {
+        result.message = 'This voucher has expired.';
+        return result;
+    }
+
+    if (voucherData.privacy && voucherData.privacy !== "global") {
+        if (voucherData.privacy !== userData.email && voucherData.privacy !== userData.displayName) {
+            result.message = 'This voucher is not applicable to your account.';
+            return result;
+        }
+    }
+
+    const orderSubtotal = productPrice * quantity;
+    const currentOrderFees = calculateServerFees(productPrice);
+
+    if (voucherData.type === "Discount Voucher") {
+        if (voucherData.ordersAmount && quantity < voucherData.ordersAmount) {
+            result.message = `You need at least ${voucherData.ordersAmount} of this item to use this voucher.`;
+            return result;
+        }
+        if (voucherData.validPrice && orderSubtotal < voucherData.validPrice) {
+            result.message = `Order subtotal must be at least ${voucherData.validPrice.toLocaleString()} for this voucher.`;
+            return result;
+        }
+        result.deduction = parseFloat(voucherData.amount) || 0;
+    } else if (voucherData.type === "Fee Voucher") {
+        if (voucherData.validFee && currentOrderFees < voucherData.validFee) {
+            result.message = `Order fees must be at least ${voucherData.validFee.toLocaleString()} for this voucher.`;
+            return result;
+        }
+        result.deduction = Math.min((parseFloat(voucherData.amount) / 100) * currentOrderFees, currentOrderFees);
+    } else {
+        result.message = 'Unknown voucher type.';
+        return result;
+    }
+
+    result.isValid = true;
+    result.message = `${voucherData.type} applied successfully!`;
+    result.appliedVoucherData = { ...voucherData };
+    return result;
+}
+
+function generateOrderReference() {
+    const ts = Date.now();
+    const randomSuffix = Array(5).fill(null).map(() => Math.random().toString(36).charAt(2)).join('').toUpperCase();
+    return `ORD-${ts}-${randomSuffix}`;
+}
+
+app.post('/api/create-order', authenticateToken, async (req, res) => {
+    const senderUid = req.user.uid;
+    const senderEmail = req.user.email;
+
+    const {
+        relatedProductDetails,
+        orderSpecificDetails,
+        voucherInfo,
+        giftDetails,
+        giftExpirationISO
+    } = req.body;
+
+    if (!relatedProductDetails || !relatedProductDetails.productId || typeof relatedProductDetails.quantity !== 'number' || relatedProductDetails.quantity < 1 || relatedProductDetails.quantity > 5) {
+        return res.status(400).json({ success: false, error: "Invalid product details or quantity." });
+    }
+    if (!orderSpecificDetails) {
+        return res.status(400).json({ success: false, error: "Missing order specific details." });
+    }
+    if (giftDetails && giftDetails.isGift) {
+        if (!giftDetails.giftRecipientUid || !giftExpirationISO) {
+            return res.status(400).json({ success: false, error: "Missing recipient UID or expiration for gift." });
+        }
+        if (giftDetails.giftRecipientUid === senderUid) {
+            return res.status(400).json({ success: false, error: "You cannot gift an item to yourself." });
+        }
+    } else if (!orderSpecificDetails.userEmail) {
+         return res.status(400).json({ success: false, error: "Delivery email is required for non-gift orders." });
+    }
+
+
+    try {
+        const senderUserRef = dbAdmin.collection("users").doc(senderUid);
+        const product = await fetchProductFromDB(relatedProductDetails.productId);
+
+        if (!product) {
+            return res.status(404).json({ success: false, error: "Product not found or is invalid." });
+        }
+        if (product.isProductGroupUnavailable) {
+            return res.status(400).json({ success: false, error: `Product group '${product.productGroupName}' is currently unavailable.` });
+        }
+        if (product.price < 0 || product.price > 500000) {
+            return res.status(400).json({ success: false, error: "Product price is invalid or exceeds limit." });
+        }
+
+        const serverCalculatedSingleItemPrice = product.price;
+        const serverCalculatedFees = calculateServerFees(serverCalculatedSingleItemPrice);
+        const quantity = (giftDetails && giftDetails.isGift) ? 1 : relatedProductDetails.quantity;
+
+        let serverVoucherDeduction = 0;
+        let validatedVoucherData = null;
+        if (voucherInfo && voucherInfo.code && !(giftDetails && giftDetails.isGift)) {
+            const voucherValidationResult = await validateVoucherOnServer(voucherInfo.code, serverCalculatedSingleItemPrice, quantity, senderUid);
+            if (voucherValidationResult.isValid) {
+                serverVoucherDeduction = voucherValidationResult.deduction;
+                validatedVoucherData = voucherValidationResult.appliedVoucherData;
+            } else {
+                return res.status(400).json({ success: false, error: `Voucher Error: ${voucherValidationResult.message}` });
+            }
+        }
+
+        const finalAmountPaid = (serverCalculatedSingleItemPrice * quantity) + serverCalculatedFees - serverVoucherDeduction;
+        if (finalAmountPaid < 0) {
+            return res.status(400).json({ success: false, error: "Total amount is invalid after deductions." });
+        }
+
+        let recipientDataSnapshot = null;
+        if (giftDetails && giftDetails.isGift) {
+            recipientDataSnapshot = await dbAdmin.collection("users").doc(giftDetails.giftRecipientUid).get();
+            if (!recipientDataSnapshot.exists) {
+                return res.status(404).json({ success: false, error: "Gift recipient user not found." });
+            }
+        }
+
+        const orderReference = generateOrderReference();
+        const newOrderRef = dbAdmin.collection("orders").doc();
+
+        const transactionResult = await dbAdmin.runTransaction(async (transaction) => {
+            const senderDocSnap = await transaction.get(senderUserRef);
+            if (!senderDocSnap.exists) throw new Error("Sender user data not found during transaction.");
+            const senderData = senderDocSnap.data();
+            const senderCurrentBalance = Number(senderData.balance) || 0;
+
+            if (senderCurrentBalance < finalAmountPaid) {
+                throw new Error("Insufficient balance (checked during transaction).");
+            }
+
+            const orderTimestamp = FieldValueAdmin.serverTimestamp();
+            let giftExpirationTimestamp = null;
+            if (giftDetails && giftDetails.isGift && giftExpirationISO) {
+                try {
+                    giftExpirationTimestamp = TimestampAdmin.fromDate(new Date(giftExpirationISO));
+                } catch (e) { throw new Error("Invalid gift expiration date format."); }
+            }
+
+            const orderData = {
+                orderId: newOrderRef.id, userId: senderUid, userEmail: senderEmail,
+                referenceNumber: orderReference, productName: product.name, productId: product.id,
+                productGroupName: product.productGroupName, mainCategoryName: product.mainCategoryName,
+                quantity: quantity, singleItemPrice: serverCalculatedSingleItemPrice, totalFees: serverCalculatedFees,
+                voucherCode: validatedVoucherData?.code || null,
+                voucherDeduction: serverVoucherDeduction,
+                voucherId: validatedVoucherData?.id || null,
+                finalAmountPaid: finalAmountPaid, orderTimestamp: orderTimestamp,
+                status: (giftDetails && giftDetails.isGift) ? "sent_gift" : "pending",
+                deliveryDetails: orderSpecificDetails,
+                isGift: !!(giftDetails && giftDetails.isGift),
+                giftTo: giftDetails?.giftRecipientAccountID || null,
+                giftToFullName: giftDetails && giftDetails.isGift && recipientDataSnapshot ? (recipientDataSnapshot.data().displayName || giftDetails.giftRecipientAccountID) : null,
+                giftToEmail: giftDetails && giftDetails.isGift && recipientDataSnapshot ? recipientDataSnapshot.data().email : null,
+                giftRecipientUid: giftDetails?.giftRecipientUid || null,
+                giftSenderId: (giftDetails && giftDetails.isGift) ? senderUid : null,
+                giftSenderDisplayName: (giftDetails && giftDetails.isGift) ? (senderData.displayName || senderEmail.split('@')[0]) : null,
+                giftSenderPhotoURL: (giftDetails && giftDetails.isGift) ? (senderData.photoURL || `https://api.dicebear.com/7.x/identicon/svg?seed=${senderUid}`) : null,
+                giftExpiration: giftExpirationTimestamp,
+                lastUpdatedAt: FieldValueAdmin.serverTimestamp()
+            };
+            transaction.set(newOrderRef, orderData);
+
+            const senderTransactionRef = senderUserRef.collection("transactions").doc();
+            const senderTransactionType = (giftDetails && giftDetails.isGift) ? TransactionTypeServer.Gifted : TransactionTypeServer.Order;
+            const senderTransactionDesc = (giftDetails && giftDetails.isGift)
+                ? `Gifted: ${product.name} to ${orderData.giftToFullName || orderData.giftTo}`
+                : `Order: ${product.name}`;
+            const senderTransactionData = {
+                timestamp: FieldValueAdmin.serverTimestamp(), type: senderTransactionType, amount: -Math.abs(finalAmountPaid),
+                reference: senderTransactionRef.id, description: senderTransactionDesc, externalReference: orderReference,
+                relatedDocId: newOrderRef.id,
+                metadata: {
+                    orderId: newOrderRef.id, orderReference: orderReference, productName: product.name, quantity: quantity,
+                    category: product.productGroupName, isGift: orderData.isGift, status: (giftDetails && giftDetails.isGift) ? "completed" : "pending",
+                    orderDate: new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString(), // Use current ISO time
+                    ...(orderData.isGift && { giftTo: orderData.giftTo, giftToFullName: orderData.giftToFullName, giftToEmail: orderData.giftToEmail, giftExpiration: giftExpirationISO }),
+                    ...(validatedVoucherData && !orderData.isGift && { voucherCode: validatedVoucherData.code, voucherDeduction: serverVoucherDeduction, voucherId: validatedVoucherData.id })
+                }
+            };
+            transaction.set(senderTransactionRef, senderTransactionData);
+
+            const senderUserUpdates = {
+                balance: FieldValueAdmin.increment(-Math.abs(finalAmountPaid)),
+                orderCount: FieldValueAdmin.increment(1), lastTransaction: FieldValueAdmin.serverTimestamp(),
+                [`transactionStats.${senderTransactionType}`]: FieldValueAdmin.increment(1)
+            };
+            if (!senderData.firstTransaction) senderUserUpdates.firstTransaction = FieldValueAdmin.serverTimestamp();
+            if (validatedVoucherData && !orderData.isGift) senderUserUpdates.redeemedVoucherIds = FieldValueAdmin.arrayUnion(validatedVoucherData.id);
+            transaction.update(senderUserRef, senderUserUpdates);
+
+            if (orderData.isGift && recipientDataSnapshot) {
+                const recipientUserRefInternal = dbAdmin.collection("users").doc(orderData.giftRecipientUid);
+                const recipientTransactionRef = recipientUserRefInternal.collection("transactions").doc();
+                const recipientTransactionData = {
+                    timestamp: FieldValueAdmin.serverTimestamp(), type: TransactionTypeServer.Received_Gift, amount: 0,
+                    reference: recipientTransactionRef.id, description: `Received a gift: ${product.name} from ${orderData.giftSenderDisplayName}`,
+                    externalReference: orderReference, relatedDocId: newOrderRef.id,
+                    metadata: {
+                        orderId: newOrderRef.id, orderReference: orderReference, productName: product.name, quantity: quantity,
+                        category: product.productGroupName, isGift: true, status: "pending",
+                        orderDate: new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString(),
+                        giftSenderId: senderUid, giftSenderDisplayName: orderData.giftSenderDisplayName, giftSenderPhotoURL: orderData.giftSenderPhotoURL,
+                        giftExpiration: giftExpirationISO
+                    }
+                };
+                transaction.set(recipientTransactionRef, recipientTransactionData);
+                transaction.update(recipientUserRefInternal, {
+                    giftReceivedCount: FieldValueAdmin.increment(1),
+                    lastGiftReceivedAt: FieldValueAdmin.serverTimestamp(),
+                    [`transactionStats.${TransactionTypeServer.Received_Gift}`]: FieldValueAdmin.increment(1)
+                });
+            }
+
+            if (validatedVoucherData && !orderData.isGift) {
+                transaction.update(dbAdmin.collection("vouchers").doc(validatedVoucherData.id), {
+                    redemptionCount: FieldValueAdmin.increment(1),
+                    lastRedeemedBy: senderUid,
+                    lastRedeemedAt: FieldValueAdmin.serverTimestamp()
+                });
+            }
+            return { orderId: newOrderRef.id, orderReference: orderReference, finalAmountPaid: finalAmountPaid };
+        });
+
+        res.status(201).json({
+            success: true, message: "Order processed successfully!",
+            orderId: transactionResult.orderId, orderReference: transactionResult.orderReference,
+            finalAmountPaid: transactionResult.finalAmountPaid
+        });
+
+    } catch (error) {
+        console.error(`SERVER ERROR /api/create-order for user ${senderUid}:`, error);
+        res.status(500).json({ success: false, error: error.message || "Failed to create order." });
+    }
+});
+
+// Other existing endpoints (/get-mlbb-username, /api/gift-order-processed, etc.) remain.
+// Make sure they are compatible with any changes or use TransactionTypeServer.
 
 app.post('/get-mlbb-username', async (req, res) => {
     const { userId, zoneId } = req.body;
@@ -81,7 +420,7 @@ app.post('/get-mlbb-username', async (req, res) => {
         const username = decodeURIComponent(response.data.result?.username || "")
             .replace(/\+/g, ' ')
             .trim();
-        if (username) { // Only cache if username is found
+        if (username) {
             usernameCache.set(cacheKey, username);
         }
         res.json({ username });
@@ -99,81 +438,28 @@ app.get('/cache', (req, res) => {
     res.json(cacheEntries);
 });
 
-
-// ----- NEW ENDPOINTS FOR GIFTING FLOW -----
-
-// Middleware for Firebase ID Token Authentication (RECOMMENDED FOR PRODUCTION)
-async function authenticateToken(req, res, next) {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(403).send('Unauthorized: No token provided.');
-    }
-    const idToken = authHeader.split('Bearer ')[1];
-    try {
-        const decodedToken = await admin.auth().verifyIdToken(idToken);
-        req.user = decodedToken; // Add user info to request object
-        next();
-    } catch (error) {
-        console.error('Error verifying Firebase ID token:', error);
-        res.status(403).send('Unauthorized: Invalid token.');
-    }
-}
-
-
-const TransactionTypeServer = { // Define on server to avoid client-side mismatch issues
-    Order: 'Order',
-    Receive: 'Receive',
-    Sent: 'Sent',
-    Redeemed: 'Redeemed',
-    Gifted: 'Gifted',
-    Received_Gift: 'Received Gift',
-    Refund: 'Refund'
-};
-
-
-// Endpoint 1: After a gift order is successfully created by the sender on the client
 app.post('/api/gift-order-processed', authenticateToken, async (req, res) => {
     const {
-        orderId,
-        recipientUid,
-        senderUid, // userId from client
-        senderDisplayName,
-        senderPhotoURL,
-        productName,
-        quantity,
-        category, // productGroupName from client
-        orderReference,
-        giftExpirationISO // giftExpiration.toDate().toISOString() from client
+        orderId, recipientUid, senderUid, senderDisplayName, senderPhotoURL,
+        productName, quantity, category, orderReference, giftExpirationISO
     } = req.body;
 
     if (!orderId || !recipientUid || !senderUid || !productName || !quantity || !category || !orderReference || !giftExpirationISO) {
         return res.status(400).json({ error: "Missing required fields for processing gift order." });
     }
-
     try {
         const batch = dbAdmin.batch();
         const recipientTransactionRef = dbAdmin.collection("users").doc(recipientUid).collection("transactions").doc();
         const recipientUserRef = dbAdmin.collection("users").doc(recipientUid);
 
         const recipientTransactionRecData = {
-            timestamp: FieldValueAdmin.serverTimestamp(),
-            type: TransactionTypeServer.Received_Gift,
-            amount: 0,
-            reference: recipientTransactionRef.id,
-            description: `Received a gift: ${productName} from ${senderDisplayName || 'a friend'}`,
-            externalReference: orderReference,
-            relatedDocId: orderId,
+            timestamp: FieldValueAdmin.serverTimestamp(), type: TransactionTypeServer.Received_Gift, amount: 0,
+            reference: recipientTransactionRef.id, description: `Received a gift: ${productName} from ${senderDisplayName || 'a friend'}`,
+            externalReference: orderReference, relatedDocId: orderId,
             metadata: {
-                orderId: orderId,
-                orderReference: orderReference,
-                productName: productName,
-                quantity: quantity,
-                category: category,
-                isGift: true,
-                status: "pending",
-                orderDate: new Date().toISOString(), // Or use orderTimestamp from client if passed
-                giftSenderId: senderUid,
-                giftSenderDisplayName: senderDisplayName,
+                orderId: orderId, orderReference: orderReference, productName: productName, quantity: quantity, category: category,
+                isGift: true, status: "pending", orderDate: new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString(),
+                giftSenderId: senderUid, giftSenderDisplayName: senderDisplayName,
                 giftSenderPhotoURL: senderPhotoURL || `https://api.dicebear.com/7.x/identicon/svg?seed=${senderUid}`,
                 giftExpiration: giftExpirationISO,
             }
@@ -181,17 +467,11 @@ app.post('/api/gift-order-processed', authenticateToken, async (req, res) => {
         batch.set(recipientTransactionRef, recipientTransactionRecData);
 
         const recipientUserUpdates = {
-            giftReceivedCount: FieldValueAdmin.increment(1),
-            lastGiftReceivedAt: FieldValueAdmin.serverTimestamp(),
+            giftReceivedCount: FieldValueAdmin.increment(1), lastGiftReceivedAt: FieldValueAdmin.serverTimestamp(),
             [`transactionStats.${TransactionTypeServer.Received_Gift}`]: FieldValueAdmin.increment(1),
         };
-        // Using update with { merge: true } on set if the user doc might not exist and you want to create it.
-        // Or ensure user doc exists. For now, update assumes it exists based on prior validation.
-        batch.update(recipientUserRef, recipientUserUpdates); // This will fail if recipientUserRef does not exist.
-        // Consider: batch.set(recipientUserRef, recipientUserUpdates, { merge: true }); if it might not exist.
-
+        batch.update(recipientUserRef, recipientUserUpdates);
         await batch.commit();
-        console.log(`Successfully processed recipient side for gift order: ${orderId}`);
         res.status(200).json({ success: true, message: "Recipient gift data processed." });
     } catch (error) {
         console.error("Error in /api/gift-order-processed:", error);
@@ -199,92 +479,11 @@ app.post('/api/gift-order-processed', authenticateToken, async (req, res) => {
     }
 });
 
-
-// Endpoint 2: After a gift is successfully claimed by the recipient on the client
-app.post('/api/gift-claimed-processed', authenticateToken, async (req, res) => {
-    const { orderId, senderUid } = req.body;
-
-    if (!orderId || !senderUid) {
-        return res.status(400).json({ error: "Missing orderId or senderUid." });
-    }
-
-    try {
-        const senderTransactionsQuery = dbAdmin.collection("users").doc(senderUid).collection("transactions")
-            .where("relatedDocId", "==", orderId)
-            .where("type", "==", TransactionTypeServer.Gifted); // Ensure this matches the type used by client
-
-        const senderTransactionsSnap = await senderTransactionsQuery.get();
-
-        if (senderTransactionsSnap.empty) {
-            console.warn(`Sender's 'Gifted' transaction not found for order ${orderId}, sender ${senderUid} during claim processing.`);
-            // Not necessarily an error for this endpoint, but good to log.
-            return res.status(404).json({ success: false, message: "Sender's gifted transaction not found." });
-        }
-
-        const batch = dbAdmin.batch();
-        senderTransactionsSnap.docs.forEach(doc => {
-            batch.update(doc.ref, {
-                'metadata.status': "claimed",
-                lastUpdatedAt: FieldValueAdmin.serverTimestamp()
-            });
-        });
-
-        await batch.commit();
-        console.log(`Successfully updated sender's transaction for claimed gift order: ${orderId}`);
-        res.status(200).json({ success: true, message: "Sender's transaction updated for claimed gift." });
-    } catch (error) {
-        console.error("Error in /api/gift-claimed-processed:", error);
-        res.status(500).json({ error: "Failed to update sender's transaction for claimed gift.", details: error.message });
-    }
-});
-
-// Endpoint 3: After a gift is successfully refunded by the sender on the client
-app.post('/api/gift-refund-processed', authenticateToken, async (req, res) => {
-    const { orderId, recipientUid } = req.body;
-
-    if (!orderId || !recipientUid) {
-        return res.status(400).json({ error: "Missing orderId or recipientUid." });
-    }
-
-    try {
-        const receiverTransactionsQuery = dbAdmin.collection("users").doc(recipientUid).collection("transactions")
-            .where("relatedDocId", "==", orderId)
-            .where("type", "==", TransactionTypeServer.Received_Gift);
-
-        const receiverTransactionsSnap = await receiverTransactionsQuery.get();
-
-        if (receiverTransactionsSnap.empty) {
-            console.warn(`Recipient's 'Received_Gift' transaction not found for order ${orderId}, recipient ${recipientUid} during refund processing.`);
-            return res.status(404).json({ success: false, message: "Recipient's received gift transaction not found." });
-        }
-
-        const batch = dbAdmin.batch();
-        receiverTransactionsSnap.docs.forEach(doc => {
-            batch.update(doc.ref, {
-                'metadata.status': "expired", // Or 'refunded_by_sender'
-                status: "expired",
-                lastUpdatedAt: FieldValueAdmin.serverTimestamp()
-            });
-        });
-
-        await batch.commit();
-        console.log(`Successfully updated recipient's transaction for refunded gift order: ${orderId}`);
-        res.status(200).json({ success: true, message: "Recipient's transaction updated for refunded gift." });
-    } catch (error) {
-        console.error("Error in /api/gift-refund-processed:", error);
-        res.status(500).json({ error: "Failed to update recipient's transaction for refunded gift.", details: error.message });
-    }
-});
-
-
-// (Optional but Recommended) Endpoint 4: For voucher redemption count update
 app.post('/api/voucher-redeemed', authenticateToken, async (req, res) => {
-    const { voucherId, userId } = req.body; // userId is the user who redeemed it
-
+    const { voucherId, userId } = req.body;
     if (!voucherId || !userId) {
         return res.status(400).json({ error: "Missing voucherId or userId." });
     }
-
     try {
         const voucherRef = dbAdmin.collection("vouchers").doc(voucherId);
         await voucherRef.update({
@@ -292,11 +491,10 @@ app.post('/api/voucher-redeemed', authenticateToken, async (req, res) => {
             lastRedeemedBy: userId,
             lastRedeemedAt: FieldValueAdmin.serverTimestamp()
         });
-        console.log(`Voucher ${voucherId} redeemed by ${userId}`);
         res.status(200).json({ success: true, message: "Voucher redeemed successfully." });
     } catch (error) {
         console.error("Error in /api/voucher-redeemed:", error);
-        if (error.code === 5) { // Firestore 'NOT_FOUND' error
+        if (error.code === 5) {
             return res.status(404).json({ error: "Voucher not found." });
         }
         res.status(500).json({ error: "Failed to update voucher.", details: error.message });
@@ -307,42 +505,26 @@ app.post('/api/claim-gift', authenticateToken, async (req, res) => {
     const { orderId } = req.body;
     const claimingUserId = req.user.uid;
 
-    if (!orderId) {
-        return res.status(400).json({ success: false, error: "Missing orderId." });
-    }
+    if (!orderId) return res.status(400).json({ success: false, error: "Missing orderId." });
 
     const orderRef = dbAdmin.collection("orders").doc(orderId);
-
     try {
         const claimResult = await dbAdmin.runTransaction(async (transaction) => {
-            // --- ALL READS MUST COME FIRST ---
-            const orderDoc = await transaction.get(orderRef); // READ 1
+            const orderDoc = await transaction.get(orderRef);
+            if (!orderDoc.exists) throw new Error("Gift order not found.");
+            const orderData = orderDoc.data();
 
-            if (!orderDoc.exists) {
-                throw new Error("Gift order not found.");
-            }
-            const orderData = orderDoc.data(); // Data from READ 1
-
-            // Query for recipient's "Received_Gift" transaction
             const receiverTransactionsQuery = dbAdmin.collection("users").doc(claimingUserId).collection("transactions")
-                .where("relatedDocId", "==", orderId)
-                .where("type", "==", TransactionTypeServer.Received_Gift);
-            const receiverTransactionsSnap = await transaction.get(receiverTransactionsQuery); // READ 2
+                .where("relatedDocId", "==", orderId).where("type", "==", TransactionTypeServer.Received_Gift);
+            const receiverTransactionsSnap = await transaction.get(receiverTransactionsQuery);
 
-            // Query for sender's "Gifted" transaction (using orderData from READ 1)
-            let senderGiftedTxSnap; // Declare here
-            if (orderData.giftSenderId) { // Ensure giftSenderId exists before querying
-                 const senderGiftedTxQuery = dbAdmin.collection("users").doc(orderData.giftSenderId).collection("transactions")
-                    .where("relatedDocId", "==", orderId)
-                    .where("type", "==", TransactionTypeServer.Gifted);
-                 senderGiftedTxSnap = await transaction.get(senderGiftedTxQuery); // READ 3
-            } else {
-                console.error(`Critical: giftSenderId missing for orderId: ${orderId} (in transaction pre-fetch)`);
-                // Handle this case - maybe throw an error or set senderGiftedTxSnap to indicate it's empty/not found
-                // For now, if it's missing, the later check for senderGiftedTxSnap.empty will handle it.
+            let senderGiftedTxSnap;
+            if (orderData.giftSenderId) {
+                const senderGiftedTxQuery = dbAdmin.collection("users").doc(orderData.giftSenderId).collection("transactions")
+                    .where("relatedDocId", "==", orderId).where("type", "==", TransactionTypeServer.Gifted);
+                senderGiftedTxSnap = await transaction.get(senderGiftedTxQuery);
             }
 
-            // --- VALIDATIONS (using data from the reads above) ---
             if (!orderData.isGift) throw new Error("This is not a gift order.");
             if (orderData.status !== 'sent_gift') {
                 if (orderData.status === 'claimed') throw new Error("This gift has already been claimed.");
@@ -351,112 +533,59 @@ app.post('/api/claim-gift', authenticateToken, async (req, res) => {
             if (orderData.giftRecipientUid !== claimingUserId) throw new Error("This gift is not intended for you.");
             const giftExpirationDate = orderData.giftExpiration ? orderData.giftExpiration.toDate() : null;
             if (giftExpirationDate && giftExpirationDate.getTime() <= Date.now()) throw new Error("This gift has expired.");
-            if (!orderData.giftSenderId) { // Redundant check but good for safety
-                console.error(`Critical: giftSenderId missing for orderId: ${orderId}`);
-                throw new Error("Gift sender information is missing.");
-            }
-            if (receiverTransactionsSnap.empty) {
-                throw new Error("Your gift reception record is missing. Please contact support.");
-            }
+            if (!orderData.giftSenderId) throw new Error("Gift sender information is missing.");
+            if (receiverTransactionsSnap.empty) throw new Error("Your gift reception record is missing.");
+
             const receiverGiftTransactionRef = receiverTransactionsSnap.docs[0].ref;
-            // --- END OF VALIDATIONS ---
-
-
-            // Product details
             const productNameForTx = orderData.productName || "Product";
             const productGroupNameForTx = orderData.productGroupName || "Category";
             const quantityForTx = orderData.quantity || 1;
             const originalGiftPriceForTx = (orderData.singleItemPrice || 0) * quantityForTx;
 
-            // --- ALL WRITES COME AFTER ALL READS ---
-            // 1. Update the original order document
             transaction.update(orderRef, {
-                status: "claimed",
-                claimedBy: claimingUserId,
-                claimedAt: FieldValueAdmin.serverTimestamp(),
-                lastUpdatedAt: FieldValueAdmin.serverTimestamp()
+                status: "claimed", claimedBy: claimingUserId,
+                claimedAt: FieldValueAdmin.serverTimestamp(), lastUpdatedAt: FieldValueAdmin.serverTimestamp()
             });
 
-            // 2. Create a new "Order" transaction for the recipient
             const recipientNewOrderTxRef = dbAdmin.collection("users").doc(claimingUserId).collection("transactions").doc();
-            const recipientNewOrderTxData = { /* ... as before ... */
-                timestamp: FieldValueAdmin.serverTimestamp(),
-                type: TransactionTypeServer.Order,
-                amount: 0,
-                reference: recipientNewOrderTxRef.id,
-                description: `Claimed gift: ${productNameForTx} from ${orderData.giftSenderDisplayName || 'a friend'}`,
-                externalReference: orderData.referenceNumber,
-                relatedDocId: orderId,
+            transaction.set(recipientNewOrderTxRef, {
+                timestamp: FieldValueAdmin.serverTimestamp(), type: TransactionTypeServer.Order, amount: 0,
+                reference: recipientNewOrderTxRef.id, description: `Claimed gift: ${productNameForTx} from ${orderData.giftSenderDisplayName || 'a friend'}`,
+                externalReference: orderData.referenceNumber, relatedDocId: orderId,
                 metadata: {
-                    orderId: orderId,
-                    orderReference: orderData.referenceNumber,
-                    productName: productNameForTx,
-                    quantity: quantityForTx,
-                    category: productGroupNameForTx,
-                    isGift: true,
-                    giftSenderId: orderData.giftSenderId,
+                    orderId: orderId, orderReference: orderData.referenceNumber, productName: productNameForTx, quantity: quantityForTx,
+                    category: productGroupNameForTx, isGift: true, giftSenderId: orderData.giftSenderId,
                     giftSenderDisplayName: orderData.giftSenderDisplayName,
                     giftSenderPhotoURL: orderData.giftSenderPhotoURL || `https://api.dicebear.com/7.x/identicon/svg?seed=${orderData.giftSenderId}`,
-                    status: "completed",
-                    orderDate: new Date().toISOString(),
+                    status: "completed", orderDate: new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString(),
                     originalGiftPrice: originalGiftPriceForTx,
                     deliveryDetails: { userEmail: req.user.email, ...(orderData.deliveryDetails || {}) }
                 }
-            };
-            transaction.set(recipientNewOrderTxRef, recipientNewOrderTxData);
-
-            // 3. Update the receiver's original "Received_Gift" transaction
-            transaction.update(receiverGiftTransactionRef, {
-                'metadata.status': "claimed",
-                status: "claimed",
-                lastUpdatedAt: FieldValueAdmin.serverTimestamp()
             });
 
-            // 4. Update recipient's user document
-            const recipientUserRef = dbAdmin.collection("users").doc(claimingUserId);
-            transaction.update(recipientUserRef, {
-                orderCount: FieldValueAdmin.increment(1),
-                lastOrderAt: FieldValueAdmin.serverTimestamp(),
-                giftClaimedCount: FieldValueAdmin.increment(1),
-                lastGiftClaimedAt: FieldValueAdmin.serverTimestamp(),
+            transaction.update(receiverGiftTransactionRef, {
+                'metadata.status': "claimed", status: "claimed", lastUpdatedAt: FieldValueAdmin.serverTimestamp()
+            });
+
+            transaction.update(dbAdmin.collection("users").doc(claimingUserId), {
+                orderCount: FieldValueAdmin.increment(1), lastOrderAt: FieldValueAdmin.serverTimestamp(),
+                giftClaimedCount: FieldValueAdmin.increment(1), lastGiftClaimedAt: FieldValueAdmin.serverTimestamp(),
                 [`transactionStats.${TransactionTypeServer.Order}`]: FieldValueAdmin.increment(1)
             });
 
-            // 5. (Optional) Update sender's "Gifted" transaction status (using senderGiftedTxSnap from READ 3)
             if (senderGiftedTxSnap && !senderGiftedTxSnap.empty) {
                 senderGiftedTxSnap.docs.forEach(doc => {
                     transaction.update(doc.ref, {
-                        'metadata.status': "claimed",
-                        lastUpdatedAt: FieldValueAdmin.serverTimestamp()
+                        'metadata.status': "claimed", lastUpdatedAt: FieldValueAdmin.serverTimestamp()
                     });
                 });
-            } else if (orderData.giftSenderId) { // Only warn if we expected to find it
-                console.warn(`Sender's 'Gifted' transaction not found for order ${orderId} (sender: ${orderData.giftSenderId}) during server-side claim's write phase.`);
             }
-
-            return { ...orderData, status: "claimed", claimedBy: claimingUserId, claimedAt: "PENDING_SERVER_TIME", lastUpdatedAt: "PENDING_SERVER_TIME", orderId: orderRef.id };
+            return { ...orderData, status: "claimed", claimedBy: claimingUserId, orderId: orderRef.id };
         });
-
-        // Transaction successful
-        // Manually construct the 'claimedAt' and 'lastUpdatedAt' for the response if needed,
-        // or refetch the order document if the client absolutely needs the resolved server timestamps.
-        // For simplicity, the client might just use the fact that the call was successful.
-        const finalClaimResult = { ...claimResult };
-        // If you returned "PENDING_SERVER_TIME", you might want to fetch the final doc
-        // const updatedOrderDoc = await orderRef.get();
-        // finalClaimResult.claimedAt = updatedOrderDoc.data().claimedAt;
-        // finalClaimResult.lastUpdatedAt = updatedOrderDoc.data().lastUpdatedAt;
-
-
-        res.status(200).json({
-            success: true,
-            message: "Gift claimed successfully.",
-            claimedOrderData: finalClaimResult
-        });
-
+        res.status(200).json({ success: true, message: "Gift claimed successfully.", claimedOrderData: claimResult });
     } catch (error) {
-        console.error(`SERVER ERROR in /api/claim-gift for order ${orderId}, user ${claimingUserId}:`, error);
-        res.status(500).json({ success: false, error: error.message || "Failed to claim gift due to a server error." });
+        console.error(`SERVER ERROR /api/claim-gift for order ${orderId}:`, error);
+        res.status(500).json({ success: false, error: error.message || "Failed to claim gift." });
     }
 });
 
@@ -464,160 +593,109 @@ app.post('/api/update-claimed-gift-delivery-details', authenticateToken, async (
     const { orderId, deliveryDetailsFromRecipient } = req.body;
     const claimingUserId = req.user.uid;
 
-    if (!orderId || !deliveryDetailsFromRecipient) {
-        return res.status(400).json({ success: false, error: "Missing orderId or delivery details." });
+    if (!orderId || !deliveryDetailsFromRecipient || typeof deliveryDetailsFromRecipient !== 'object') {
+        return res.status(400).json({ success: false, error: "Missing or invalid orderId or delivery details." });
     }
-    if (typeof deliveryDetailsFromRecipient !== 'object' || deliveryDetailsFromRecipient === null) {
-        return res.status(400).json({ success: false, error: "Invalid delivery details format." });
-    }
-
     try {
         const claimUpdateResult = await dbAdmin.runTransaction(async (transaction) => {
             const orderRef = dbAdmin.collection("orders").doc(orderId);
             const orderDoc = await transaction.get(orderRef);
-
-            if (!orderDoc.exists) {
-                throw new Error("Order not found. Cannot update delivery details.");
-            }
+            if (!orderDoc.exists) throw new Error("Order not found.");
             const orderData = orderDoc.data();
 
             if (orderData.status !== "claimed" || orderData.claimedBy !== claimingUserId) {
-                throw new Error("This gift cannot be updated at this time or does not belong to you.");
+                throw new Error("Gift cannot be updated or does not belong to you.");
             }
 
-            const recipientOrderTxQuery = dbAdmin.collection("users").doc(claimingUserId)
-                .collection("transactions")
-                .where("relatedDocId", "==", orderId)
-                .where("type", "==", TransactionTypeServer.Order)
-                .limit(1);
+            const recipientOrderTxQuery = dbAdmin.collection("users").doc(claimingUserId).collection("transactions")
+                .where("relatedDocId", "==", orderId).where("type", "==", TransactionTypeServer.Order).limit(1);
             const recipientOrderTxSnap = await transaction.get(recipientOrderTxQuery);
+            if (recipientOrderTxSnap.empty) throw new Error("Recipient's claimed order transaction not found.");
 
-            if (recipientOrderTxSnap.empty) {
-                console.error(`Recipient's claimed order transaction (type: Order, relatedDocId: ${orderId}) not found for user ${claimingUserId}.`);
-                throw new Error("Recipient's claimed order transaction record not found.");
-            }
             const recipientOrderTxRef = recipientOrderTxSnap.docs[0].ref;
-
             transaction.update(recipientOrderTxRef, {
-                'metadata.deliveryDetails': deliveryDetailsFromRecipient,
-                lastUpdatedAt: FieldValueAdmin.serverTimestamp()
+                'metadata.deliveryDetails': deliveryDetailsFromRecipient, lastUpdatedAt: FieldValueAdmin.serverTimestamp()
             });
-            transaction.update(orderRef, { // Also update main order for admin/record keeping
-                deliveryDetails: deliveryDetailsFromRecipient,
-                lastUpdatedAt: FieldValueAdmin.serverTimestamp()
+            transaction.update(orderRef, {
+                deliveryDetails: deliveryDetailsFromRecipient, lastUpdatedAt: FieldValueAdmin.serverTimestamp()
             });
             return { updatedOrderId: orderId, newDeliveryDetails: deliveryDetailsFromRecipient };
         });
-        res.status(200).json({
-            success: true,
-            message: "Delivery details updated successfully for your claimed gift.",
-            data: claimUpdateResult
-        });
+        res.status(200).json({ success: true, message: "Delivery details updated.", data: claimUpdateResult });
     } catch (error) {
-        console.error(`SERVER ERROR in /api/update-claimed-gift-delivery-details for order ${orderId}:`, error);
+        console.error(`SERVER ERROR /api/update-claimed-gift-delivery-details for order ${orderId}:`, error);
         res.status(500).json({ success: false, error: error.message || "Failed to update delivery details." });
     }
 });
 
+// Ensure check-redemption-code and redeem-code endpoints are also present and functional
 app.post('/api/check-redemption-code', authenticateToken, async (req, res) => {
     const { code } = req.body;
     const userId = req.user.uid;
 
-    if (!code) {
-        return res.status(400).json({ success: false, error: "Redemption code is required." });
-    }
+    if (!code) return res.status(400).json({ success: false, error: "Redemption code is required." });
 
     try {
         const rewardsQuery = dbAdmin.collection("rewards").where("code", "==", code.toUpperCase());
         const rewardsSnapshot = await rewardsQuery.get();
 
-        if (rewardsSnapshot.empty) {
-            return res.status(404).json({ success: false, error: "Invalid or expired redemption code." });
-        }
+        if (rewardsSnapshot.empty) return res.status(404).json({ success: false, error: "Invalid or expired redemption code." });
 
         const rewardDoc = rewardsSnapshot.docs[0];
         const rewardData = rewardDoc.data();
         const rewardId = rewardDoc.id;
 
-        // Check expiration
         if (rewardData.expirationDate) {
             const expirationDate = (rewardData.expirationDate.toDate) ? rewardData.expirationDate.toDate() : new Date(rewardData.expirationDate);
-            if (new Date() > expirationDate) {
-                return res.status(400).json({ success: false, error: "This code has expired." });
-            }
+            if (new Date() > expirationDate) return res.status(400).json({ success: false, error: "This code has expired." });
         }
 
-        // Check global redemption limit
         const redemptionCount = Number(rewardData.redemptionCount) || 0;
         const maxRedemptions = Number(rewardData.maxRedemptions);
         if (maxRedemptions > 0 && redemptionCount >= maxRedemptions) {
             return res.status(400).json({ success: false, error: "This code has reached its global redemption limit." });
         }
 
-        // Check if user has already redeemed this specific reward (if applicable based on type)
-        // For 'choices' and 'airdrop' type, a user typically redeems it once.
-        // For 'form' or 'redemptionKey', it might depend on your specific logic.
         if (rewardData.type === 'choices' || rewardData.type === 'airdrop' || rewardData.type === 'form') {
             const userTransactionsRef = dbAdmin.collection("users").doc(userId).collection("transactions");
             const priorRedemptionQuery = userTransactionsRef
                 .where("relatedDocId", "==", rewardId)
-                .where("type", "in", [TransactionTypeServer.Receive, TransactionTypeServer.Redeemed]); // "Receive" for choices, "Redeemed" for airdrop/form
+                .where("type", "in", [TransactionTypeServer.Receive, TransactionTypeServer.Redeemed]);
             const priorRedemptionSnapshot = await priorRedemptionQuery.get();
-
-            if (!priorRedemptionSnapshot.empty) {
-                return res.status(400).json({ success: false, error: "You have already redeemed/claimed this code." });
-            }
+            if (!priorRedemptionSnapshot.empty) return res.status(400).json({ success: false, error: "You have already redeemed/claimed this code." });
         }
 
-        // Return necessary reward data (excluding sensitive info if any)
         res.status(200).json({
-            success: true,
-            message: "Code is valid.",
+            success: true, message: "Code is valid.",
             reward: {
-                id: rewardId,
-                title: rewardData.title,
-                type: rewardData.type,
-                value: rewardData.value, // Be cautious about exposing this if it's not meant for client display before claim
-                imageUrl: rewardData.imageUrl,
-                instructions: rewardData.instructions,
-                formFields: rewardData.formFields, // For 'form' type
-                RedemptionKeyHint: rewardData.RedemptionKeyHint, // For 'redemptionKey' type
-                // Do NOT return the actual RedemptionKey here
-                maxRedemptions: rewardData.maxRedemptions,
+                id: rewardId, title: rewardData.title, type: rewardData.type, value: rewardData.value,
+                imageUrl: rewardData.imageUrl, instructions: rewardData.instructions, formFields: rewardData.formFields,
+                RedemptionKeyHint: rewardData.RedemptionKeyHint, maxRedemptions: rewardData.maxRedemptions,
                 redemptionCount: rewardData.redemptionCount
             }
         });
-
     } catch (error) {
         console.error("Error in /api/check-redemption-code:", error);
-        res.status(500).json({ success: false, error: "Server error checking code. Please try again." });
+        res.status(500).json({ success: false, error: "Server error checking code." });
     }
 });
 
-
-// Endpoint 2: Process Redemption (handles 'choices' type directly, initiates others)
 app.post('/api/redeem-code', authenticateToken, async (req, res) => {
-    const { code } = req.body; // Client sends the code they want to redeem
+    const { code } = req.body;
     const userId = req.user.uid;
 
-    if (!code) {
-        return res.status(400).json({ success: false, error: "Redemption code is required." });
-    }
+    if (!code) return res.status(400).json({ success: false, error: "Redemption code is required." });
 
     try {
         const result = await dbAdmin.runTransaction(async (transaction) => {
             const rewardsQuery = dbAdmin.collection("rewards").where("code", "==", code.toUpperCase());
             const rewardsSnapshot = await transaction.get(rewardsQuery);
-
-            if (rewardsSnapshot.empty) {
-                throw new Error("Invalid or expired redemption code.");
-            }
+            if (rewardsSnapshot.empty) throw new Error("Invalid or expired redemption code.");
 
             const rewardDocRef = rewardsSnapshot.docs[0].ref;
             const rewardData = rewardsSnapshot.docs[0].data();
             const rewardId = rewardDocRef.id;
 
-            // --- Re-validate reward (expiration, limits) within transaction ---
             if (rewardData.expirationDate) {
                 const expirationDate = (rewardData.expirationDate.toDate) ? rewardData.expirationDate.toDate() : new Date(rewardData.expirationDate);
                 if (new Date() > expirationDate) throw new Error("This code has expired.");
@@ -628,69 +706,49 @@ app.post('/api/redeem-code', authenticateToken, async (req, res) => {
                 throw new Error("This code has reached its global redemption limit.");
             }
 
-            // --- Check user's prior redemption within transaction ---
             const userTransactionsRef = dbAdmin.collection("users").doc(userId).collection("transactions");
-            // Adjust types based on what you check for "already redeemed" for each reward type
             let relevantTxTypes = [TransactionTypeServer.Receive, TransactionTypeServer.Redeemed];
-            if (rewardData.type === 'redemptionKey') { // Example: Maybe redemptionKey can be used multiple times?
-                // relevantTxTypes = []; // Or a specific type if one is logged
-            }
-
             if (relevantTxTypes.length > 0) {
                 const priorRedemptionQuery = userTransactionsRef
                     .where("relatedDocId", "==", rewardId)
                     .where("type", "in", relevantTxTypes);
                 const priorRedemptionSnapshot = await transaction.get(priorRedemptionQuery);
-                if (!priorRedemptionSnapshot.empty) {
-                    throw new Error("You have already redeemed/claimed this code.");
-                }
+                if (!priorRedemptionSnapshot.empty) throw new Error("You have already redeemed/claimed this code.");
             }
 
             const userRef = dbAdmin.collection("users").doc(userId);
             const userDoc = await transaction.get(userRef);
-            if (!userDoc.exists) {
-                throw new Error("User data not found. Cannot process redemption.");
-            }
+            if (!userDoc.exists) throw new Error("User data not found.");
             const userData = userDoc.data();
 
-            // --- Perform actions based on reward type ---
             let transactionType, transactionAmount, transactionDescription, responseMessage;
             let userBalanceUpdate = {};
             let rewardUpdate = {
-                redemptionCount: FieldValueAdmin.increment(1),
-                lastRedeemedAt: FieldValueAdmin.serverTimestamp()
+                redemptionCount: FieldValueAdmin.increment(1), lastRedeemedAt: FieldValueAdmin.serverTimestamp()
             };
             let additionalResponseData = {};
 
             if (rewardData.type === 'choices') {
-                transactionType = TransactionTypeServer.Receive; // Using 'Receive' for balance addition
+                transactionType = TransactionTypeServer.Receive;
                 transactionAmount = Number(rewardData.value) || 0;
                 if (transactionAmount <= 0) throw new Error("Invalid reward value for 'choices' type.");
-
                 transactionDescription = `Redeemed: ${rewardData.title || rewardData.code}`;
-                responseMessage = `🎉 Code redeemed! +${transactionAmount.toLocaleString()} added to your balance.`;
-                userBalanceUpdate = {
-                    balance: FieldValueAdmin.increment(transactionAmount)
-                };
-                // For 'choices' type, the 'value' of the reward itself might be a pool that decreases.
-                // If `rewardData.value` is the total available points in the reward itself that deplete:
-                // rewardUpdate.value = FieldValueAdmin.increment(-transactionAmount); // If reward.value is a pool
-                // Ensure rewardUpdate.value doesn't go below 0 if it's a pool.
-                // For simplicity here, assuming rewardData.value is the fixed amount given per redemption.
+                responseMessage = `Code redeemed! +${transactionAmount.toLocaleString()} added to your balance.`;
+                userBalanceUpdate = { balance: FieldValueAdmin.increment(transactionAmount) };
             } else if (rewardData.type === 'airdrop') {
-                transactionType = TransactionTypeServer.Redeemed; // A claim record, not direct value
-                transactionAmount = 0; // Airdrop itself doesn't add balance directly
+                transactionType = TransactionTypeServer.Redeemed;
+                transactionAmount = 0;
                 transactionDescription = `Airdrop claimed: ${rewardData.title || rewardData.code}`;
                 responseMessage = `Airdrop "${rewardData.title || rewardData.code}" claimed! Proceed to select your reward(s).`;
                 additionalResponseData = { proceedTo: 'choicesModal', rewardValueForChoices: rewardData.value };
             } else if (rewardData.type === 'form') {
-                transactionType = TransactionTypeServer.Redeemed; // Record of claim
-                transactionAmount = 0; // Form itself doesn't add balance directly
+                transactionType = TransactionTypeServer.Redeemed;
+                transactionAmount = 0;
                 transactionDescription = `Form access code redeemed: ${rewardData.title || rewardData.code}`;
                 responseMessage = `Code "${rewardData.title || rewardData.code}" accepted. Please fill the form.`;
                 additionalResponseData = { proceedTo: 'formModal' };
             } else if (rewardData.type === 'redemptionKey') {
-                transactionType = TransactionTypeServer.Redeemed; // Record of claim
+                transactionType = TransactionTypeServer.Redeemed;
                 transactionAmount = 0;
                 transactionDescription = `Key code input: ${rewardData.title || rewardData.code}`;
                 responseMessage = `Code "${rewardData.title || rewardData.code}" is a special key. Enter it in the next step.`;
@@ -699,61 +757,34 @@ app.post('/api/redeem-code', authenticateToken, async (req, res) => {
                 throw new Error(`Unsupported reward type: ${rewardData.type}`);
             }
 
-            // Update reward document
             transaction.update(rewardDocRef, rewardUpdate);
-
-            // Update user document
-            const finalUserUpdates = {
-                ...userBalanceUpdate,
-                transactionCount: FieldValueAdmin.increment(1),
-                lastTransaction: FieldValueAdmin.serverTimestamp(),
-                [`transactionStats.${transactionType}`]: FieldValueAdmin.increment(1)
-            };
-            if (userData.firstTransaction === null && (userData.transactionCount === 0 || typeof userData.transactionCount === 'undefined')) {
+            const finalUserUpdates = { ...userBalanceUpdate, transactionCount: FieldValueAdmin.increment(1), lastTransaction: FieldValueAdmin.serverTimestamp(), [`transactionStats.${transactionType}`]: FieldValueAdmin.increment(1) };
+            if (userData.firstTransaction === null || typeof userData.transactionCount === 'undefined' || userData.transactionCount === 0 ) {
                 finalUserUpdates.firstTransaction = FieldValueAdmin.serverTimestamp();
             }
             transaction.update(userRef, finalUserUpdates);
 
-            // Create transaction record for the user
             const newTransactionRef = userTransactionsRef.doc();
             transaction.set(newTransactionRef, {
-                timestamp: FieldValueAdmin.serverTimestamp(),
-                type: transactionType,
-                amount: transactionAmount,
-                reference: newTransactionRef.id,
-                description: transactionDescription,
-                externalReference: rewardData.code,
+                timestamp: FieldValueAdmin.serverTimestamp(), type: transactionType, amount: transactionAmount,
+                reference: newTransactionRef.id, description: transactionDescription, externalReference: rewardData.code,
                 relatedDocId: rewardId,
                 metadata: {
-                    rewardTitle: rewardData.title || "N/A",
-                    rewardType: rewardData.type,
-                    code: rewardData.code,
+                    rewardTitle: rewardData.title || "N/A", rewardType: rewardData.type, code: rewardData.code,
                     ...(rewardData.type === 'airdrop' && { airdropNominalValue: rewardData.value })
                 }
             });
-
             const newBalance = (userData.balance || 0) + (userBalanceUpdate.balance ? transactionAmount : 0);
-
             return {
-                message: responseMessage,
-                newBalance: newBalance,
-                transactionId: newTransactionRef.id,
+                message: responseMessage, newBalance: newBalance, transactionId: newTransactionRef.id,
                 rewardType: rewardData.type,
-                rewardDetails: { // Send back some reward details for client UI
-                    id: rewardId,
-                    title: rewardData.title,
-                    value: rewardData.value, // Original value for airdrop choices, etc.
-                    imageUrl: rewardData.imageUrl,
-                    instructions: rewardData.instructions,
-                    formFields: rewardData.formFields,
-                    RedemptionKeyHint: rewardData.RedemptionKeyHint
-                },
-                ...additionalResponseData
+                rewardDetails: {
+                    id: rewardId, title: rewardData.title, value: rewardData.value, imageUrl: rewardData.imageUrl,
+                    instructions: rewardData.instructions, formFields: rewardData.formFields, RedemptionKeyHint: rewardData.RedemptionKeyHint
+                }, ...additionalResponseData
             };
-        }); // End of Firestore Transaction
-
+        });
         res.status(200).json({ success: true, ...result });
-
     } catch (error) {
         console.error("Error in /api/redeem-code:", error);
         res.status(500).json({ success: false, error: error.message || "Server error redeeming code." });
@@ -762,4 +793,4 @@ app.post('/api/redeem-code', authenticateToken, async (req, res) => {
 
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`API Server running on port ${PORT}`));
