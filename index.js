@@ -791,6 +791,129 @@ app.post('/api/redeem-code', authenticateToken, async (req, res) => {
     }
 });
 
+app.post('/api/process-gift-refund', authenticateToken, async (req, res) => {
+    const { orderId, senderTxId } = req.body; // senderTxId is the ID of the sender's "Gifted" transaction
+    const senderUid = req.user.uid;
+
+    if (!orderId || !senderTxId) {
+        return res.status(400).json({ success: false, error: "Missing orderId or senderTxId." });
+    }
+
+    const orderRef = dbAdmin.collection("orders").doc(orderId);
+    const senderUserRef = dbAdmin.collection("users").doc(senderUid);
+    const senderGiftedTxRef = senderUserRef.collection("transactions").doc(senderTxId);
+
+    try {
+        const refundResult = await dbAdmin.runTransaction(async (transaction) => {
+            const orderDoc = await transaction.get(orderRef);
+            if (!orderDoc.exists) throw new Error("Gift order not found.");
+            const orderData = orderDoc.data();
+
+            const senderDoc = await transaction.get(senderUserRef);
+            if (!senderDoc.exists) throw new Error("Sender user data not found.");
+            // const senderData = senderDoc.data(); // Not strictly needed for balance update with increment
+
+            const senderGiftedTxDoc = await transaction.get(senderGiftedTxRef);
+            if (!senderGiftedTxDoc.exists) throw new Error("Sender's original 'Gifted' transaction not found.");
+
+
+            // Validations
+            if (!orderData.isGift) throw new Error("This order is not a gift and cannot be refunded through this process.");
+            if (orderData.userId !== senderUid) throw new Error("You are not authorized to refund this gift.");
+            if (orderData.status !== 'sent_gift' && orderData.status !== 'pending') { // 'pending' might be an initial state for some gifts
+                if (orderData.status === 'refunded') throw new Error("This gift has already been refunded.");
+                if (orderData.status === 'claimed') throw new Error("This gift has been claimed and cannot be refunded.");
+                throw new Error(`This gift cannot be refunded due to its current status: ${orderData.status}.`);
+            }
+            const giftExpirationDate = orderData.giftExpiration ? orderData.giftExpiration.toDate() : null;
+            if (!giftExpirationDate || giftExpirationDate.getTime() > Date.now()) {
+                throw new Error("This gift has not yet expired and cannot be refunded.");
+            }
+            if (orderData.claimedBy) throw new Error("This gift has already been claimed.");
+            if (!orderData.giftRecipientUid) throw new Error("Recipient information is missing for this gift order.");
+
+
+            const refundAmount = (orderData.singleItemPrice || 0) * (orderData.quantity || 1);
+            if (refundAmount <= 0) throw new Error("Invalid refund amount calculated (must be greater than 0).");
+
+            // 1. Update the main order document
+            transaction.update(orderRef, {
+                status: "refunded",
+                refundedBy: senderUid,
+                refundedAt: FieldValueAdmin.serverTimestamp(),
+                lastUpdatedAt: FieldValueAdmin.serverTimestamp()
+            });
+
+            // 2. Update sender's original "Gifted" transaction metadata
+            transaction.update(senderGiftedTxRef, {
+                'metadata.status': "refunded", // Assuming 'status' is in metadata
+                // status: "refunded", // If you also have a top-level status field on the transaction
+                lastUpdatedAt: FieldValueAdmin.serverTimestamp()
+            });
+
+            // 3. Update sender's user document (balance, stats)
+            const senderUserUpdates = {
+                balance: FieldValueAdmin.increment(refundAmount),
+                lastTransaction: FieldValueAdmin.serverTimestamp(),
+                [`transactionStats.${TransactionTypeServer.Refund}`]: FieldValueAdmin.increment(1)
+            };
+            transaction.update(senderUserRef, senderUserUpdates);
+
+            // 4. Create a new "Refund" transaction for the sender
+            const newRefundTxRef = senderUserRef.collection("transactions").doc();
+            const refundTxData = {
+                timestamp: FieldValueAdmin.serverTimestamp(),
+                type: TransactionTypeServer.Refund,
+                amount: refundAmount,
+                reference: newRefundTxRef.id,
+                description: `Refund for expired gift: ${orderData.productName || 'Unknown Product'} (Order Ref: ${orderData.referenceNumber || orderId})`,
+                externalReference: orderData.referenceNumber || orderId,
+                relatedDocId: orderId,
+                metadata: {
+                    refundType: 'Gift Expiration',
+                    originalOrderId: orderId,
+                    originalOrderRef: orderData.referenceNumber,
+                    productName: orderData.productName,
+                    refundedTo: req.user.email, // Sender's email
+                    status: 'completed'
+                }
+            };
+            transaction.set(newRefundTxRef, refundTxData);
+
+            // 5. Update recipient's "Received_Gift" transaction metadata
+            const recipientUserRef = dbAdmin.collection("users").doc(orderData.giftRecipientUid);
+            const recipientGiftTxQuery = recipientUserRef.collection("transactions")
+                .where("relatedDocId", "==", orderId)
+                .where("type", "==", TransactionTypeServer.Received_Gift)
+                .limit(1);
+
+            const recipientGiftTxSnapshot = await transaction.get(recipientGiftTxQuery);
+            if (!recipientGiftTxSnapshot.empty) {
+                const recipientGiftTxDocRef = recipientGiftTxSnapshot.docs[0].ref;
+                transaction.update(recipientGiftTxDocRef, {
+                    'metadata.status': "expired", // Or "refunded_by_sender"
+                    // status: "expired", // If you have a top-level status field
+                    lastUpdatedAt: FieldValueAdmin.serverTimestamp()
+                });
+            } else {
+                console.warn(`Recipient's 'Received_Gift' transaction not found for order ${orderId} and recipient ${orderData.giftRecipientUid}. Skipping update.`);
+            }
+
+            return {
+                message: "Gift refunded successfully.",
+                refundedAmount: refundAmount,
+                orderId: orderId
+            };
+        });
+
+        res.status(200).json({ success: true, ...refundResult });
+
+    } catch (error) {
+        console.error(`SERVER ERROR /api/process-gift-refund for order ${orderId}, user ${senderUid}:`, error);
+        res.status(500).json({ success: false, error: error.message || "Failed to process gift refund." });
+    }
+});
+
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`API Server running on port ${PORT}`));
