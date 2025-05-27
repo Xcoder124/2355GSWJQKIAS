@@ -792,7 +792,7 @@ app.post('/api/redeem-code', authenticateToken, async (req, res) => {
 });
 
 app.post('/api/process-gift-refund', authenticateToken, async (req, res) => {
-    const { orderId, senderTxId } = req.body; // senderTxId is the ID of the sender's "Gifted" transaction
+    const { orderId, senderTxId } = req.body;
     const senderUid = req.user.uid;
 
     if (!orderId || !senderTxId) {
@@ -805,22 +805,22 @@ app.post('/api/process-gift-refund', authenticateToken, async (req, res) => {
 
     try {
         const refundResult = await dbAdmin.runTransaction(async (transaction) => {
+            // --- PHASE 1: ALL READS ---
             const orderDoc = await transaction.get(orderRef);
             if (!orderDoc.exists) throw new Error("Gift order not found.");
             const orderData = orderDoc.data();
 
             const senderDoc = await transaction.get(senderUserRef);
             if (!senderDoc.exists) throw new Error("Sender user data not found.");
-            // const senderData = senderDoc.data(); // Not strictly needed for balance update with increment
+            // const senderData = senderDoc.data(); // Data can be extracted if needed for validations
 
             const senderGiftedTxDoc = await transaction.get(senderGiftedTxRef);
             if (!senderGiftedTxDoc.exists) throw new Error("Sender's original 'Gifted' transaction not found.");
 
-
-            // Validations
+            // Perform validations using data from reads before any other reads that depend on this data
             if (!orderData.isGift) throw new Error("This order is not a gift and cannot be refunded through this process.");
             if (orderData.userId !== senderUid) throw new Error("You are not authorized to refund this gift.");
-            if (orderData.status !== 'sent_gift' && orderData.status !== 'pending') { // 'pending' might be an initial state for some gifts
+            if (orderData.status !== 'sent_gift' && orderData.status !== 'pending') {
                 if (orderData.status === 'refunded') throw new Error("This gift has already been refunded.");
                 if (orderData.status === 'claimed') throw new Error("This gift has been claimed and cannot be refunded.");
                 throw new Error(`This gift cannot be refunded due to its current status: ${orderData.status}.`);
@@ -830,11 +830,24 @@ app.post('/api/process-gift-refund', authenticateToken, async (req, res) => {
                 throw new Error("This gift has not yet expired and cannot be refunded.");
             }
             if (orderData.claimedBy) throw new Error("This gift has already been claimed.");
-            if (!orderData.giftRecipientUid) throw new Error("Recipient information is missing for this gift order.");
+            if (!orderData.giftRecipientUid) throw new Error("Recipient UID is missing in order data, cannot process refund fully.");
 
+            // Last set of reads: Recipient's "Received_Gift" transaction
+            // This read depends on orderData.giftRecipientUid, which was read above.
+            let recipientGiftTxSnapshot = null; // Initialize
+            const recipientUserRef = dbAdmin.collection("users").doc(orderData.giftRecipientUid);
+            const recipientGiftTxQuery = recipientUserRef.collection("transactions")
+                .where("relatedDocId", "==", orderId)
+                .where("type", "==", TransactionTypeServer.Received_Gift)
+                .limit(1);
+            recipientGiftTxSnapshot = await transaction.get(recipientGiftTxQuery); // This must be the last read operation
 
+            // --- PHASE 2: ALL WRITES ---
             const refundAmount = (orderData.singleItemPrice || 0) * (orderData.quantity || 1);
-            if (refundAmount <= 0) throw new Error("Invalid refund amount calculated (must be greater than 0).");
+            if (refundAmount <= 0) { // Gifts should have a value that can be refunded
+                console.error("Calculated refundAmount is zero or negative for order:", orderId, "Price:", orderData.singleItemPrice, "Qty:", orderData.quantity);
+                throw new Error("Invalid refund amount calculated (must be greater than 0 for a gift refund).");
+            }
 
             // 1. Update the main order document
             transaction.update(orderRef, {
@@ -846,9 +859,10 @@ app.post('/api/process-gift-refund', authenticateToken, async (req, res) => {
 
             // 2. Update sender's original "Gifted" transaction metadata
             transaction.update(senderGiftedTxRef, {
-                'metadata.status': "refunded", // Assuming 'status' is in metadata
-                // status: "refunded", // If you also have a top-level status field on the transaction
+                'metadata.status': "refunded",
                 lastUpdatedAt: FieldValueAdmin.serverTimestamp()
+                // If you have a top-level status on the transaction doc, update it as well:
+                // status: "refunded"
             });
 
             // 3. Update sender's user document (balance, stats)
@@ -860,7 +874,7 @@ app.post('/api/process-gift-refund', authenticateToken, async (req, res) => {
             transaction.update(senderUserRef, senderUserUpdates);
 
             // 4. Create a new "Refund" transaction for the sender
-            const newRefundTxRef = senderUserRef.collection("transactions").doc();
+            const newRefundTxRef = senderUserRef.collection("transactions").doc(); // Define ref
             const refundTxData = {
                 timestamp: FieldValueAdmin.serverTimestamp(),
                 type: TransactionTypeServer.Refund,
@@ -874,29 +888,24 @@ app.post('/api/process-gift-refund', authenticateToken, async (req, res) => {
                     originalOrderId: orderId,
                     originalOrderRef: orderData.referenceNumber,
                     productName: orderData.productName,
-                    refundedTo: req.user.email, // Sender's email
-                    status: 'completed'
+                    refundedTo: req.user.email, // Sender's email from authenticated token
+                    status: 'completed' // The refund transaction itself is completed
                 }
             };
-            transaction.set(newRefundTxRef, refundTxData);
+            transaction.set(newRefundTxRef, refundTxData); // Perform the set
 
-            // 5. Update recipient's "Received_Gift" transaction metadata
-            const recipientUserRef = dbAdmin.collection("users").doc(orderData.giftRecipientUid);
-            const recipientGiftTxQuery = recipientUserRef.collection("transactions")
-                .where("relatedDocId", "==", orderId)
-                .where("type", "==", TransactionTypeServer.Received_Gift)
-                .limit(1);
-
-            const recipientGiftTxSnapshot = await transaction.get(recipientGiftTxQuery);
-            if (!recipientGiftTxSnapshot.empty) {
+            // 5. Update recipient's "Received_Gift" transaction metadata (if it exists)
+            if (recipientGiftTxSnapshot && !recipientGiftTxSnapshot.empty) {
                 const recipientGiftTxDocRef = recipientGiftTxSnapshot.docs[0].ref;
                 transaction.update(recipientGiftTxDocRef, {
-                    'metadata.status': "expired", // Or "refunded_by_sender"
-                    // status: "expired", // If you have a top-level status field
+                    'metadata.status': "expired", // Or "refunded_by_sender" to be more specific
                     lastUpdatedAt: FieldValueAdmin.serverTimestamp()
+                    // If you have a top-level status on the transaction doc, update it as well:
+                    // status: "expired"
                 });
             } else {
-                console.warn(`Recipient's 'Received_Gift' transaction not found for order ${orderId} and recipient ${orderData.giftRecipientUid}. Skipping update.`);
+                // This is not an error that should halt the transaction, but good to log.
+                console.warn(`Recipient's 'Received_Gift' transaction for order ${orderId} (recipient ${orderData.giftRecipientUid}) not found. Skipping its update.`);
             }
 
             return {
@@ -913,7 +922,6 @@ app.post('/api/process-gift-refund', authenticateToken, async (req, res) => {
         res.status(500).json({ success: false, error: error.message || "Failed to process gift refund." });
     }
 });
-
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`API Server running on port ${PORT}`));
