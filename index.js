@@ -551,7 +551,7 @@ app.post('/api/claim-gift', authenticateToken, async (req, res) => {
 
         res.status(200).json({
             success: true,
-            message: "Gift is valid. Please provide your delivery details.",
+            message: "Gift is valid, proceed on providing your in-game details...",
             // Client-side was updated to expect 'claimedOrderData' as the key.
             // The data itself should be the order in its 'sent_gift' state.
             claimedOrderData: giftOrderDataForClient
@@ -900,12 +900,10 @@ app.post('/api/process-gift-refund', authenticateToken, async (req, res) => {
 app.post('/api/finalize-gift-claim', authenticateToken, async (req, res) => {
     const { originalOrderId, deliveryDetailsFromRecipient } = req.body;
     const claimingUserId = req.user.uid;
-    // const claimingUserEmail = req.user.email; // Available if needed
 
     if (!originalOrderId || !deliveryDetailsFromRecipient || typeof deliveryDetailsFromRecipient !== 'object') {
         return res.status(400).json({ success: false, error: "Missing or invalid orderId or delivery details." });
     }
-    // Basic validation for delivery details, add more as needed
     if (!deliveryDetailsFromRecipient.userEmail) {
         return res.status(400).json({ success: false, error: "Recipient's delivery email is missing in details." });
     }
@@ -914,49 +912,63 @@ app.post('/api/finalize-gift-claim', authenticateToken, async (req, res) => {
 
     try {
         const finalizedClaimResult = await dbAdmin.runTransaction(async (transaction) => {
-            const orderDoc = await transaction.get(orderRef);
+            const orderDoc = await transaction.get(orderRef); // First read
             if (!orderDoc.exists) {
                 throw new Error("Gift order not found.");
             }
             const orderData = orderDoc.data();
 
-            // Re-validate before finalizing
-            if (!orderData.isGift) {
-                throw new Error("This is not a gift order.");
-            }
-            if (orderData.status !== 'sent_gift') {
-                if (orderData.status === 'claimed') throw new Error("This gift has already been claimed.");
-                throw new Error(`This gift cannot be claimed due to its current status: ${orderData.status}.`);
-            }
-            if (orderData.giftRecipientUid !== claimingUserId) {
-                throw new Error("This gift is not intended for you.");
-            }
-            const giftExpirationDate = orderData.giftExpiration ? orderData.giftExpiration.toDate() : null;
-            if (giftExpirationDate && giftExpirationDate.getTime() <= Date.now()) {
-                throw new Error("This gift has expired and can no longer be claimed.");
-            }
-            if (!orderData.giftSenderId) {
-                throw new Error("Critical: Gift sender information is missing from the order data.");
-            }
-
+            // Perform all other necessary reads before any writes
             const receiverTransactionsQuery = dbAdmin.collection("users").doc(claimingUserId).collection("transactions")
                 .where("relatedDocId", "==", originalOrderId)
                 .where("type", "==", TransactionTypeServer.Received_Gift)
                 .limit(1);
-            const receiverTransactionsSnap = await transaction.get(receiverTransactionsQuery);
-            // It's crucial that a "Received_Gift" transaction exists for the recipient.
-            if (receiverTransactionsSnap.empty) {
-                 console.error(`Recipient's 'Received_Gift' transaction for order ${originalOrderId} (recipient ${claimingUserId}) not found during finalization.`);
-                throw new Error("Recipient's gift reception record is missing. Cannot finalize claim.");
+            const receiverTransactionsSnap = await transaction.get(receiverTransactionsQuery); // Second read
+
+            let senderGiftedTxSnap = null; // Initialize
+            if (orderData.giftSenderId) { // Conditional read based on first read's data
+                const senderGiftedTxQuery = dbAdmin.collection("users").doc(orderData.giftSenderId).collection("transactions")
+                    .where("relatedDocId", "==", originalOrderId)
+                    .where("type", "==", TransactionTypeServer.Gifted)
+                    .limit(1);
+                senderGiftedTxSnap = await transaction.get(senderGiftedTxQuery); // Third read (conditional)
             }
 
-            // 1. Update the main order document
+            // --- All reads are now complete ---
+
+            // --- Validations based on read data ---
+            if (!orderData.isGift) throw new Error("This is not a gift order.");
+            if (orderData.status !== 'sent_gift') {
+                if (orderData.status === 'claimed') throw new Error("This gift has already been claimed.");
+                throw new Error(`This gift cannot be claimed due to its current status: ${orderData.status}.`);
+            }
+            if (orderData.giftRecipientUid !== claimingUserId) throw new Error("This gift is not intended for you.");
+            const giftExpirationDate = orderData.giftExpiration ? orderData.giftExpiration.toDate() : null;
+            if (giftExpirationDate && giftExpirationDate.getTime() <= Date.now()) throw new Error("This gift has expired and can no longer be claimed.");
+            if (!orderData.giftSenderId) throw new Error("Critical: Gift sender information is missing from the order data.");
+            if (receiverTransactionsSnap.empty) throw new Error("Recipient's gift reception record is missing. Cannot finalize claim.");
+
+
+            // --- Start Writes ---
+            const serverTimestamp = FieldValueAdmin.serverTimestamp(); // Get timestamp once
+
+            // 1. Prepare updated order data object for return (without re-reading)
+            const updatedOrderDataForReturn = {
+                ...orderData, // Spread existing data
+                orderId: orderDoc.id, // Ensure orderId is part of the returned object
+                status: "claimed",
+                claimedBy: claimingUserId,
+                claimedAt: serverTimestamp, // Will be a sentinel value, resolved by server
+                deliveryDetails: deliveryDetailsFromRecipient,
+                lastUpdatedAt: serverTimestamp // Will be a sentinel value, resolved by server
+            };
+
             transaction.update(orderRef, {
                 status: "claimed",
                 claimedBy: claimingUserId,
-                claimedAt: FieldValueAdmin.serverTimestamp(),
+                claimedAt: serverTimestamp,
                 deliveryDetails: deliveryDetailsFromRecipient,
-                lastUpdatedAt: FieldValueAdmin.serverTimestamp()
+                lastUpdatedAt: serverTimestamp
             });
 
             const productNameForTx = orderData.productName || "Product";
@@ -964,10 +976,9 @@ app.post('/api/finalize-gift-claim', authenticateToken, async (req, res) => {
             const quantityForTx = orderData.quantity || 1;
             const originalGiftPriceForTx = (orderData.singleItemPrice || 0) * quantityForTx;
 
-            // 2. Create a new "Order" transaction for the recipient
             const recipientNewOrderTxRef = dbAdmin.collection("users").doc(claimingUserId).collection("transactions").doc();
             transaction.set(recipientNewOrderTxRef, {
-                timestamp: FieldValueAdmin.serverTimestamp(),
+                timestamp: serverTimestamp,
                 type: TransactionTypeServer.Order,
                 amount: 0,
                 reference: recipientNewOrderTxRef.id,
@@ -991,50 +1002,42 @@ app.post('/api/finalize-gift-claim', authenticateToken, async (req, res) => {
                 }
             });
 
-            // 3. Update the recipient's original "Received_Gift" transaction status
             const receiverGiftTransactionRef = receiverTransactionsSnap.docs[0].ref;
             transaction.update(receiverGiftTransactionRef, {
                 'metadata.status': "claimed",
-                lastUpdatedAt: FieldValueAdmin.serverTimestamp()
+                lastUpdatedAt: serverTimestamp
             });
 
-            // 4. Update recipient's user stats
             transaction.update(dbAdmin.collection("users").doc(claimingUserId), {
                 orderCount: FieldValueAdmin.increment(1),
-                lastOrderAt: FieldValueAdmin.serverTimestamp(),
+                lastOrderAt: serverTimestamp,
                 giftClaimedCount: FieldValueAdmin.increment(1),
-                lastGiftClaimedAt: FieldValueAdmin.serverTimestamp(),
+                lastGiftClaimedAt: serverTimestamp,
                 [`transactionStats.${TransactionTypeServer.Order}`]: FieldValueAdmin.increment(1)
             });
 
-            // 5. Update sender's original "Gifted" transaction metadata
-            if (orderData.giftSenderId) {
-                const senderGiftedTxQuery = dbAdmin.collection("users").doc(orderData.giftSenderId).collection("transactions")
-                    .where("relatedDocId", "==", originalOrderId)
-                    .where("type", "==", TransactionTypeServer.Gifted)
-                    .limit(1);
-                const senderGiftedTxSnap = await transaction.get(senderGiftedTxQuery);
-                if (!senderGiftedTxSnap.empty) {
-                    const senderGiftedTxRef = senderGiftedTxSnap.docs[0].ref;
-                    transaction.update(senderGiftedTxRef, {
-                        'metadata.status': "claimed",
-                        lastUpdatedAt: FieldValueAdmin.serverTimestamp()
-                    });
-                }
+            if (senderGiftedTxSnap && !senderGiftedTxSnap.empty) {
+                const senderGiftedTxRef = senderGiftedTxSnap.docs[0].ref;
+                transaction.update(senderGiftedTxRef, {
+                    'metadata.status': "claimed",
+                    lastUpdatedAt: serverTimestamp
+                });
             }
-            // Re-fetch the updated order data to return
-            const updatedOrderDoc = await transaction.get(orderRef);
-            return { ...updatedOrderDoc.data(), orderId: updatedOrderDoc.id };
+            
+            // Return the constructed data, not from a new transaction.get()
+            return updatedOrderDataForReturn;
         });
 
         res.status(200).json({
             success: true,
             message: "Gift claimed successfully and delivery details saved!",
-            claimedOrderData: finalizedClaimResult
+            claimedOrderData: finalizedClaimResult // This now contains the data constructed within the transaction
         });
 
     } catch (error) {
         console.error(`SERVER ERROR /api/finalize-gift-claim for order ${originalOrderId}, user ${claimingUserId}:`, error);
+        // The specific "Firestore transactions require all reads..." error message from Firestore
+        // will be part of error.message if that's the cause.
         res.status(500).json({ success: false, error: error.message || "Failed to finalize gift claim." });
     }
 });
