@@ -262,11 +262,14 @@ app.post('/api/create-order', authenticateToken, async (req, res) => {
         }
 
         let recipientDataSnapshot = null;
+        let recipientPhotoURL = null; // Variable to store recipient's photoURL
         if (giftDetails && giftDetails.isGift) {
             recipientDataSnapshot = await dbAdmin.collection("users").doc(giftDetails.giftRecipientUid).get();
             if (!recipientDataSnapshot.exists) {
                 return res.status(404).json({ success: false, error: "Gift recipient user not found." });
             }
+            // Get the recipient's photoURL
+            recipientPhotoURL = recipientDataSnapshot.data().photoURL || null;
         }
 
         const orderReference = generateOrderReference();
@@ -305,6 +308,7 @@ app.post('/api/create-order', authenticateToken, async (req, res) => {
                 giftTo: giftDetails?.giftRecipientAccountID || null,
                 giftToFullName: giftDetails && giftDetails.isGift && recipientDataSnapshot ? (recipientDataSnapshot.data().displayName || giftDetails.giftRecipientAccountID) : null,
                 giftToEmail: giftDetails && giftDetails.isGift && recipientDataSnapshot ? recipientDataSnapshot.data().email : null,
+                giftActualRecipientPhotoURL: recipientPhotoURL, // MODIFICATION: Added recipient's photo URL
                 giftRecipientUid: giftDetails?.giftRecipientUid || null,
                 giftSenderId: (giftDetails && giftDetails.isGift) ? senderUid : null,
                 giftSenderDisplayName: (giftDetails && giftDetails.isGift) ? (senderData.displayName || senderEmail.split('@')[0]) : null,
@@ -326,7 +330,7 @@ app.post('/api/create-order', authenticateToken, async (req, res) => {
                 metadata: {
                     orderId: newOrderRef.id, orderReference: orderReference, productName: product.name, quantity: quantity,
                     category: product.productGroupName, isGift: orderData.isGift, status: (giftDetails && giftDetails.isGift) ? "completed" : "pending",
-                    orderDate: new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString(), 
+                    orderDate: new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString(),
                     ...(orderData.isGift && { giftTo: orderData.giftTo, giftToFullName: orderData.giftToFullName, giftToEmail: orderData.giftToEmail, giftExpiration: giftExpirationISO }),
                     ...(validatedVoucherData && !orderData.isGift && { voucherCode: validatedVoucherData.code, voucherDeduction: serverVoucherDeduction, voucherId: validatedVoucherData.id })
                 }
