@@ -70,7 +70,7 @@ const TransactionTypeServer = {
     Gifted: 'Gifted',
     Received_Gift: 'Received Gift',
     Refund: 'Refund',
-    BirthdayBonus: 'Birthday Bonus
+    BirthdayBonus: 'Birthday Bonus'
 };
 
 function calculateServerFees(price) {
